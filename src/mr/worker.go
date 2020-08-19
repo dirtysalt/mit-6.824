@@ -7,6 +7,7 @@ import "hash/fnv"
 import "math/rand"
 import "time"
 
+
 //
 // Map functions return a slice of KeyValue.
 //
@@ -25,10 +26,15 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
+
+func runWorker(task GetTaskResp, ch chan bool) {
+	log.Printf("run worker with task: %v\n", task)
+	ch <- true
+}
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -52,9 +58,33 @@ func Worker(mapf func(string, string) []KeyValue,
 			time.Sleep(time.Duration(5) * time.Second)
 			continue;
 		}
-		fmt.Printf("worker %v: get resp: %v\n", workerId, resp);
+		task := resp
+		log.Printf("worker %v: get task: %v\n", workerId, task);
+		ch := make(chan bool)
+		go runWorker(task, ch)
+		for ;; {
+			req := ReportTaskReq {
+				WorkerId: workerId,
+				TaskId: resp.TaskId,
+				State: TASK_RUNNING,
+			}
+			resp := ReportTaskResp {}
+
+			select {
+			case <- ch: {
+				req.State = TASK_DONE
+			}
+			default: {
+				time.Sleep(time.Duration(5) * time.Second)
+			}
+			}
+			call("Master.ReportTask", &req, &resp)
+			if req.State == TASK_DONE {
+				break
+			}
+		}
 	}
-	log.Printf("worker %v: quit\n")
+	log.Printf("worker %v: quit\n", workerId)
 }
 
 //

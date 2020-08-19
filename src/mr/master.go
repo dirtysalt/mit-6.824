@@ -118,6 +118,7 @@ func (m *Master) reportTask(workerId string, taskId string, state string) {
 }
 
 func (m *Master) ReportTask(req *ReportTaskReq, resp *ReportTaskResp) error {
+	log.Printf("report task: %v\n", req)
 	m.reportTask(req.WorkerId, req.TaskId, req.State)
 	return nil
 }
@@ -161,7 +162,7 @@ func (m *Master) Done() bool {
 func (m *Master) Dump() {
 	for ;; {
 		bs, _ := json.Marshal(m);
-		log.Printf("========== master state ==========\n%v\n", string(bs))
+		log.Printf("========== master state ==========\n%v\n\n\n", string(bs))
 		time.Sleep(time.Duration(5) * time.Second)
 	}
 }
