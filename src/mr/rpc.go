@@ -26,21 +26,35 @@ type ExampleReply struct {
 
 // get a task from master
 type GetTaskReq struct {
+	WorkerId string
 }
 type GetTaskResp struct {
+	Got bool
+	Quit bool
+	TaskId string
+	InputFile string
+	OutputFile string
+	MapperNumber int
+	ReducerNumber int
 }
 
-// report task state to master
-type ReportTaskStateReq struct {
+// report task to master
+type ReportTaskReq struct {
+	WorkerId string
+	TaskId string
+	State string
 }
-type ReporttaskStateResp struct {
+
+type ReportTaskResp struct {
 }
 
 // heartbeat to master
-type WorkerHeartbeatReq struct {
+type WorkerHBReq struct {
+	WorkerId string
+	State string
 }
 
-type WorkerHeartbeatResp struct {
+type WorkerHBResp struct {
 }
 
 

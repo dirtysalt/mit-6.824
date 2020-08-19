@@ -4,7 +4,8 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
-
+import "math/rand"
+import "time"
 
 //
 // Map functions return a slice of KeyValue.
@@ -35,7 +36,25 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
+	workerId := fmt.Sprintf("%v", rand.Uint32())
 
+	log.Printf("worker %v start ...\n", workerId)
+
+	for ;; {
+		req := GetTaskReq {workerId}
+		resp := GetTaskResp {}
+		call("Master.GetTask", &req, &resp)
+		if resp.Quit {
+			break
+		}
+		if !resp.Got {
+			log.Printf("worker %v: no task. sleep 5 secs\n", workerId);
+			time.Sleep(time.Duration(5) * time.Second)
+			continue;
+		}
+		fmt.Printf("worker %v: get resp: %v\n", workerId, resp);
+	}
+	log.Printf("worker %v: quit\n")
 }
 
 //
