@@ -1,0 +1,5 @@
+mr-out*
+mr-tmp/
+mrsequential
+mrworker
+mrmaster

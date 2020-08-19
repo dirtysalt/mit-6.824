@@ -24,6 +24,26 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+// get a task from master
+type GetTaskReq struct {
+}
+type GetTaskResp struct {
+}
+
+// report task state to master
+type ReportTaskStateReq struct {
+}
+type ReporttaskStateResp struct {
+}
+
+// heartbeat to master
+type WorkerHeartbeatReq struct {
+}
+
+type WorkerHeartbeatResp struct {
+}
+
+
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

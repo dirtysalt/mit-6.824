@@ -5,11 +5,28 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
+import "time"
 
+type Task struct {
+	Id string
+	Type string
+	State string
+	InputFile string
+	OutputFile string
+	LastTime time.Time
+}
+
+type Worker struct {
+	Id string
+	State string
+	LastTime time.Time
+}
 
 type Master struct {
 	// Your definitions here.
-
+	Mappers []Task
+	Reudcers []Task
+	Workers []Worker
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -47,7 +64,7 @@ func (m *Master) server() {
 //
 func (m *Master) Done() bool {
 	ret := false
-
+	// ret := true
 	// Your code here.
 
 
