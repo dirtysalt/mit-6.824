@@ -30,8 +30,8 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 //
 
-func runWorker(task GetTaskResp, ch chan bool) {
-	log.Printf("run worker with task: %v\n", task)
+func runTask(task GetTaskResp, ch chan bool) {
+	log.Printf("run task: %v\n", task)
 	ch <- true
 }
 
@@ -44,7 +44,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// CallExample()
 	workerId := fmt.Sprintf("%v", rand.Uint32())
 
-	log.Printf("worker %v start ...\n", workerId)
+	log.Printf("worker %v: start ...\n", workerId)
 
 	for ;; {
 		req := GetTaskReq {workerId}
@@ -61,7 +61,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		task := resp
 		log.Printf("worker %v: get task: %v\n", workerId, task);
 		ch := make(chan bool)
-		go runWorker(task, ch)
+		go runTask(task, ch)
 		for ;; {
 			req := ReportTaskReq {
 				WorkerId: workerId,

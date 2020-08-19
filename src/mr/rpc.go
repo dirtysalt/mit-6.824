@@ -29,8 +29,8 @@ type GetTaskReq struct {
 	WorkerId string
 }
 type GetTaskResp struct {
-	Got bool
 	Quit bool
+	Got bool
 	TaskId string
 	InputFile string
 	OutputFile string
