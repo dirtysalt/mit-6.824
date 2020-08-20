@@ -29,35 +29,25 @@ type GetTaskReq struct {
 	WorkerId string
 }
 type GetTaskResp struct {
-	Quit bool
-	Got bool
-	TaskId string
-	InputFile string
-	OutputFile string
-	MapperNumber int
+	Quit          bool
+	Got           bool
+	TaskId        string
+	Seq           int
+	InputFile     string
+	OutputFile    string
+	MapperNumber  int
 	ReducerNumber int
 }
 
 // report task to master
 type ReportTaskReq struct {
 	WorkerId string
-	TaskId string
-	State string
+	TaskId   string
+	State    string
 }
 
 type ReportTaskResp struct {
 }
-
-// heartbeat to master
-type WorkerHBReq struct {
-	WorkerId string
-	State string
-}
-
-type WorkerHBResp struct {
-}
-
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.

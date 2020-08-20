@@ -13,28 +13,32 @@ import "sync"
 
 const (
 	TASK_UNASSIGNED = "task_unassigned"
-	TASK_RUNNING = "task_running"
-	TASK_DONE = "task_done"
+	TASK_RUNNING    = "task_running"
+	TASK_DONE       = "task_done"
 
 	WORKER_UNREACHABLE = 0
-	WORKER_UNASSIGNED = 1
-	WORKER_RUNNING = 2
+	WORKER_UNASSIGNED  = 1
+	WORKER_RUNNING     = 2
+
+	SwapFileDir = "./mr-swap"
+	TempFileDir = "./mr-temp"
 )
 
 type TaskDescriptor struct {
-	Id string
-	State string
-	InputFile string
+	Id         string
+	Seq        int
+	State      string
+	InputFile  string
 	OutputFile string
-	LastTime time.Time
+	LastTime   time.Time
 }
 
 type Master struct {
 	mux sync.Mutex
 
 	// Your definitions here.
-	Tasks []TaskDescriptor
-	MapperNumber int
+	Tasks         []TaskDescriptor
+	MapperNumber  int
 	ReducerNumber int
 }
 
@@ -50,10 +54,10 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (m *Master) getTaskA(prefix string, allDone *bool) *TaskDescriptor{
+func (m *Master) getTaskA(prefix string, allDone *bool) *TaskDescriptor {
 	now := time.Now()
 	*allDone = true
-	for i := range(m.Tasks) {
+	for i := range m.Tasks {
 		task := &m.Tasks[i]
 		if !strings.HasPrefix(task.Id, prefix) {
 			continue
@@ -61,28 +65,31 @@ func (m *Master) getTaskA(prefix string, allDone *bool) *TaskDescriptor{
 		if task.State != TASK_DONE {
 			*allDone = false
 		}
-		switch(task.State) {
-		case TASK_DONE: continue
-		case TASK_RUNNING: {
-			// TODO: if it's has running for a long time.
-			d := now.Sub(task.LastTime)
-			if d.Seconds() > 60 {
-				log.Printf("task %v has been stale for a long time: %v seconds\n", task.Id, d.Seconds())
-				return task;
-			}
+		switch task.State {
+		case TASK_DONE:
 			continue
-		}
-		case TASK_UNASSIGNED: {
-			return task
-		}
-		default: panic(fmt.Sprintf("unknown state: %v", task.State));
+		case TASK_RUNNING:
+			{
+				// TODO: if it's has running for a long time.
+				d := now.Sub(task.LastTime)
+				if d.Seconds() > 60 {
+					log.Printf("task %v has been stale for a long time: %v seconds\n", task.Id, d.Seconds())
+					return task
+				}
+				continue
+			}
+		case TASK_UNASSIGNED:
+			{
+				return task
+			}
+		default:
+			panic(fmt.Sprintf("unknown state: %v", task.State))
 		}
 	}
-	return nil;
+	return nil
 }
 
-
-func (m *Master) getTask() *TaskDescriptor{
+func (m *Master) getTask() *TaskDescriptor {
 	// ensure all mappers has been executed
 	allDone := false
 	task := m.getTaskA("mapper", &allDone)
@@ -100,7 +107,6 @@ func (m *Master) getTask() *TaskDescriptor{
 	return nil
 }
 
-
 func (m *Master) GetTask(req *GetTaskReq, resp *GetTaskResp) error {
 	m.mux.Lock()
 	defer m.mux.Unlock()
@@ -114,11 +120,12 @@ func (m *Master) GetTask(req *GetTaskReq, resp *GetTaskResp) error {
 	}
 
 	task := m.getTask()
-	log.Printf("GetTaskReq from worker:%v, return task:%v\n", req.WorkerId, task);
+	log.Printf("GetTaskReq from worker:%v, return task:%v\n", req.WorkerId, task)
 	if task != nil {
 		task.State = TASK_RUNNING
 		resp.Got = true
 		resp.TaskId = task.Id
+		resp.Seq = task.Seq
 		resp.InputFile = task.InputFile
 		resp.OutputFile = task.OutputFile
 		resp.MapperNumber = m.MapperNumber
@@ -130,7 +137,7 @@ func (m *Master) GetTask(req *GetTaskReq, resp *GetTaskResp) error {
 func (m *Master) reportTask(workerId string, taskId string, state string) {
 	found := false
 	now := time.Now()
-	for i := range(m.Tasks) {
+	for i := range m.Tasks {
 		task := &m.Tasks[i]
 		if task.Id == taskId {
 			found = true
@@ -177,7 +184,7 @@ func (m *Master) done() bool {
 	ret := true
 	// Your code here.
 
-	for i := range(m.Tasks) {
+	for i := range m.Tasks {
 		task := &m.Tasks[i]
 		if task.State != TASK_DONE {
 			ret = false
@@ -192,15 +199,22 @@ func (m *Master) Done() bool {
 
 	if ret {
 		// wait all workers to quit.
-		time.Sleep(time.Duration(10)* time.Second)
+		time.Sleep(time.Duration(10) * time.Second)
 	}
 	return ret
 }
 
+func (m *Master) dump() string {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+	bs, _ := json.Marshal(m)
+	return string(bs)
+}
+
 func (m *Master) Dump() {
-	for ;; {
-		bs, _ := json.Marshal(m);
-		log.Printf("========== master state ==========\n%v\n\n\n", string(bs))
+	for {
+		data := m.dump()
+		log.Printf("========== master state ==========\n%v\n\n\n", data)
 		time.Sleep(time.Duration(5) * time.Second)
 	}
 }
@@ -213,32 +227,37 @@ func (m *Master) Dump() {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
-	swapFilePrefix := "mr-swap-"
+	os.RemoveAll(SwapFileDir)
+	os.RemoveAll(TempFileDir)
+	os.Mkdir(SwapFileDir, 0755)
+	os.Mkdir(TempFileDir, 0755)
 
 	// Your code here.
 	now := time.Now()
 
-	for i, f := range(files) {
+	for i, f := range files {
 		tid := fmt.Sprintf("mapper-%04d", i)
-		// mr-swap-<reduceno>-<mapno>
-		m.Tasks = append(m.Tasks, TaskDescriptor {
-			Id: tid,
-			State: TASK_UNASSIGNED,
-			InputFile: f,
-			OutputFile: swapFilePrefix,
-			LastTime: now,
+		// mr-swap/R<reduceno>-M<mapno>
+		m.Tasks = append(m.Tasks, TaskDescriptor{
+			Id:         tid,
+			Seq:        i,
+			State:      TASK_UNASSIGNED,
+			InputFile:  f,
+			OutputFile: SwapFileDir,
+			LastTime:   now,
 		})
 	}
 
-	for i:=0;i<nReduce;i++ {
+	for i := 0; i < nReduce; i++ {
 		tid := fmt.Sprintf("reducer-%04d", i)
 		output := fmt.Sprintf("mr-out-%04d", i)
-		m.Tasks = append(m.Tasks, TaskDescriptor {
-			Id: tid,
-			State: TASK_UNASSIGNED,
-			InputFile:swapFilePrefix,
-			OutputFile:output,
-			LastTime: now,
+		m.Tasks = append(m.Tasks, TaskDescriptor{
+			Id:         tid,
+			Seq:        i,
+			State:      TASK_UNASSIGNED,
+			InputFile:  SwapFileDir,
+			OutputFile: output,
+			LastTime:   now,
 		})
 	}
 

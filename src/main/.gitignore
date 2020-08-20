@@ -1,5 +1,7 @@
 mr-out*
 mr-tmp/
+mr-swap/
+mr-temp/
 mrsequential
 mrworker
 mrmaster
