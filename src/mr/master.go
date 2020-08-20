@@ -70,9 +70,9 @@ func (m *Master) getTaskA(prefix string, allDone *bool) *TaskDescriptor {
 			continue
 		case TASK_RUNNING:
 			{
-				// TODO: if it's has running for a long time.
+				// worker is supposed to report in every 5 seconds.
 				d := now.Sub(task.LastTime)
-				if d.Seconds() > 60 {
+				if d.Seconds() > 30 {
 					log.Printf("task %v has been stale for a long time: %v seconds\n", task.Id, d.Seconds())
 					return task
 				}
