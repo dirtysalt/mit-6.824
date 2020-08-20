@@ -89,11 +89,12 @@ func (m *Master) getTaskA(prefix string, allDone *bool) *TaskDescriptor {
 	return nil
 }
 
-func (m *Master) getTask() *TaskDescriptor {
+func (m *Master) getTaskB() *TaskDescriptor {
 	// ensure all mappers has been executed
 	allDone := false
 	task := m.getTaskA("mapper", &allDone)
 	if task != nil {
+		task.State = TASK_RUNNING
 		return task
 	}
 	if !allDone {
@@ -102,27 +103,19 @@ func (m *Master) getTask() *TaskDescriptor {
 	// then we can execute reducers.
 	task = m.getTaskA("reducer", &allDone)
 	if task != nil {
+		task.State = TASK_RUNNING
 		return task
 	}
 	return nil
 }
 
-func (m *Master) GetTask(req *GetTaskReq, resp *GetTaskResp) error {
+func (m *Master) getTask(req *GetTaskReq, resp *GetTaskResp) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
 
-	resp.Quit = false
-	resp.Got = false
-
-	if m.done() {
-		resp.Quit = true
-		return nil
-	}
-
-	task := m.getTask()
+	task := m.getTaskB()
 	log.Printf("GetTaskReq from worker:%v, return task:%v\n", req.WorkerId, task)
 	if task != nil {
-		task.State = TASK_RUNNING
 		resp.Got = true
 		resp.TaskId = task.Id
 		resp.Seq = task.Seq
@@ -131,17 +124,34 @@ func (m *Master) GetTask(req *GetTaskReq, resp *GetTaskResp) error {
 		resp.MapperNumber = m.MapperNumber
 		resp.ReducerNumber = m.ReducerNumber
 	}
+}
+
+func (m *Master) GetTask(req *GetTaskReq, resp *GetTaskResp) error {
+	resp.Quit = false
+	resp.Got = false
+
+	if m.done() {
+		resp.Quit = true
+		return nil
+	}
+
+	m.getTask(req, resp)
 	return nil
 }
 
 func (m *Master) reportTask(workerId string, taskId string, state string) {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
 	found := false
 	now := time.Now()
 	for i := range m.Tasks {
 		task := &m.Tasks[i]
 		if task.Id == taskId {
 			found = true
-			task.State = state
+			if task.State != TASK_DONE {
+				task.State = state
+			}
 			task.LastTime = now
 			break
 		}
@@ -152,8 +162,6 @@ func (m *Master) reportTask(workerId string, taskId string, state string) {
 }
 
 func (m *Master) ReportTask(req *ReportTaskReq, resp *ReportTaskResp) error {
-	m.mux.Lock()
-	defer m.mux.Unlock()
 	log.Printf("report task: %v\n", req)
 	m.reportTask(req.WorkerId, req.TaskId, req.State)
 	return nil
@@ -180,6 +188,9 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) done() bool {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
 	// ret := false
 	ret := true
 	// Your code here.
@@ -199,7 +210,7 @@ func (m *Master) Done() bool {
 
 	if ret {
 		// wait all workers to quit.
-		time.Sleep(time.Duration(10) * time.Second)
+		time.Sleep(time.Duration(5) * time.Second)
 	}
 	return ret
 }
