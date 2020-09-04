@@ -20,6 +20,8 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
+import "time"
+import "math/rand"
 
 // import "bytes"
 // import "../labgob"
@@ -63,6 +65,8 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	isLeader bool
+	lasthb time.Time
 	logs []LogEntry
 	currentTerm int
 	votedFor int
@@ -261,8 +265,78 @@ func (rf *Raft) killed() bool {
 }
 
 
-func (rf *Raft) election() {
+func (rf *Raft) checkHeartbeat() {
+	const (
+		checkInterval = 50
+		electionTimeout = 200
+		electionRandom = 30
+	)
 
+	for ;; {
+		do := false
+		if (rf.killed()) {
+			break;
+		}
+		{
+			now := time.Now()
+			rf.mu.Lock()
+			defer rf.mu.Lock()
+			off := now.Sub(rf.lasthb)
+			if (off.Milliseconds() > ((int64)(electionTimeout) + rand.Int63() % electionRandom)) {
+				do = true
+			}
+		}
+		if (!do) {
+			time.Sleep(checkInterval)
+			continue;
+		}
+		if (rf.killed()) {
+			break;
+		}
+		DPrintf("lost heartbeat, ready to elect leader. me = %d", rf.me)
+		rf.electLeader()
+	}
+}
+
+func max(a, b int) int {
+	if (a > b) {
+		return a
+	} else {
+		return b
+	}
+}
+
+func (rf *Raft) electLeader() {
+	req := RequestVoteArgs {}
+	{
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		req.Term = rf.currentTerm + 1
+		req.CandidateId = rf.me
+		log := rf.lastLogEntry()
+		req.LastLogIndex = log.index
+		req.LastLogTerm = log.term
+		rf.isLeader = false
+	}
+
+	maxCurrentTerm := 0
+	votes := 0
+	for i:= 0;i< len(rf.peers);i++ {
+		reply := RequestVoteReply{}
+		rf.sendRequestVote(i, &req, &reply)
+		maxCurrentTerm = max(maxCurrentTerm, reply.Term)
+		if (reply.VoteGranted) {
+			votes += 1
+		}
+	}
+	{
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		rf.currentTerm = maxCurrentTerm
+		if (votes > (len(rf.peers) / 2)) {
+			rf.isLeader = true
+		}
+	}
 }
 
 
@@ -285,6 +359,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.isLeader = false
 	rf.logs = []LogEntry {
 		LogEntry {
 			command: nil,
@@ -302,5 +377,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.checkHeartbeat()
 	return rf
 }
