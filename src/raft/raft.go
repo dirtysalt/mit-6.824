@@ -43,6 +43,13 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+
+type LogEntry struct {
+	command interface{}
+	term int
+	index int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -56,7 +63,13 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	logs []LogEntry
+	currentTerm int
+	votedFor int
+	commitIndex int
+	lastApplied int
+	nextIndex []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -66,6 +79,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	isleader = (rf.votedFor == rf.me)
+
 	return term, isleader
 }
 
@@ -117,6 +137,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -125,6 +149,13 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
+}
+
+func (rf *Raft) lastLogEntry() *LogEntry {
+	sz := len(rf.logs)
+	return &rf.logs[sz-1]
 }
 
 //
@@ -132,6 +163,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if ((rf.votedFor == -1 || rf.votedFor == args.CandidateId)) {
+		log := rf.lastLogEntry()
+		if ((args.LastLogTerm > log.term) ||
+			(args.LastLogTerm == log.term && args.LastLogIndex >= log.index)) {
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+		}
+	}
 }
 
 //
@@ -215,6 +260,12 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+
+func (rf *Raft) election() {
+
+}
+
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -234,10 +285,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.logs = []LogEntry {
+		LogEntry {
+			command: nil,
+			term: 0,
+			index: 0,
+		},
+	}
+	rf.currentTerm = 0
+	rf.votedFor = 0
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = []int{}
+	rf.matchIndex = []int{}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
