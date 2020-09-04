@@ -157,6 +157,7 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+
 func (rf *Raft) lastLogEntry() *LogEntry {
 	sz := len(rf.logs)
 	return &rf.logs[sz-1]
@@ -173,15 +174,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	if ((rf.votedFor == -1 || rf.votedFor == args.CandidateId)) {
-		log := rf.lastLogEntry()
-		if ((args.LastLogTerm > log.term) ||
-			(args.LastLogTerm == log.term && args.LastLogIndex >= log.index)) {
-			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
+	if (args.Term >= rf.currentTerm) {
+		if ((rf.votedFor == -1 || rf.votedFor == args.CandidateId)) {
+			log := rf.lastLogEntry()
+			if ((args.LastLogTerm > log.term) ||
+				(args.LastLogTerm == log.term && args.LastLogIndex >= log.index)) {
+				rf.votedFor = args.CandidateId
+				reply.VoteGranted = true
+			}
 		}
 	}
+	DPrintf("X%d: RequestVote: %v -> %v", rf.me, args, reply)
 }
+
+
+type AppendEntriesRequest struct {
+	SenderId int
+	Term int
+}
+
+type AppendEntriesReply struct {
+}
+
+func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if (req.Term < rf.currentTerm) {
+		return;
+	}
+	rf.currentTerm = req.Term
+	rf.lasthb = time.Now()
+}
+
+
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -214,6 +240,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -265,12 +296,43 @@ func (rf *Raft) killed() bool {
 }
 
 
+func sleepMills(v int) {
+	time.Sleep(time.Duration(v) * time.Millisecond)
+}
+
+func (rf *Raft) sendHeartbeat() {
+	const checkInterval = 30
+	DPrintf("X%d: sendHeartbeat ....", rf.me)
+	for ;; {
+		if (rf.killed()) {
+			break;
+		}
+		term := 0
+		{
+			rf.mu.Lock()
+			term = rf.currentTerm
+			defer rf.mu.Unlock()
+		}
+		req := AppendEntriesRequest {
+			SenderId: rf.me,
+			Term: term,
+		}
+		reply := AppendEntriesReply{}
+		for i:=0;i<len(rf.peers);i++ {
+			rf.sendAppendEntries(i, &req, &reply)
+		}
+		sleepMills(checkInterval)
+	}
+}
+
+
 func (rf *Raft) checkHeartbeat() {
 	const (
 		checkInterval = 50
 		electionTimeout = 200
 		electionRandom = 30
 	)
+	DPrintf("X%d: checkHeartbeat ....", rf.me)
 
 	for ;; {
 		do := false
@@ -280,20 +342,20 @@ func (rf *Raft) checkHeartbeat() {
 		{
 			now := time.Now()
 			rf.mu.Lock()
-			defer rf.mu.Lock()
 			off := now.Sub(rf.lasthb)
-			if (off.Milliseconds() > ((int64)(electionTimeout) + rand.Int63() % electionRandom)) {
+			if (off.Milliseconds() > (int64(electionTimeout) + (rand.Int63() % electionRandom))) {
 				do = true
 			}
+			defer rf.mu.Unlock()
 		}
 		if (!do) {
-			time.Sleep(checkInterval)
+			sleepMills(checkInterval)
 			continue;
 		}
 		if (rf.killed()) {
 			break;
 		}
-		DPrintf("lost heartbeat, ready to elect leader. me = %d", rf.me)
+		DPrintf("X%d: lost heartbeat, ready to elect leader", rf.me)
 		rf.electLeader()
 	}
 }
@@ -310,15 +372,16 @@ func (rf *Raft) electLeader() {
 	req := RequestVoteArgs {}
 	{
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		req.Term = rf.currentTerm + 1
+		req.Term = rf.currentTerm
 		req.CandidateId = rf.me
 		log := rf.lastLogEntry()
 		req.LastLogIndex = log.index
 		req.LastLogTerm = log.term
 		rf.isLeader = false
+		defer rf.mu.Unlock()
 	}
 
+	DPrintf("X%d: electLeader ...", rf.me)
 	maxCurrentTerm := 0
 	votes := 0
 	for i:= 0;i< len(rf.peers);i++ {
@@ -331,11 +394,18 @@ func (rf *Raft) electLeader() {
 	}
 	{
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		rf.currentTerm = maxCurrentTerm
+		rf.currentTerm = maxCurrentTerm + 1
 		if (votes > (len(rf.peers) / 2)) {
 			rf.isLeader = true
 		}
+		if (rf.isLeader) {
+			log := rf.lastLogEntry()
+			for i:=0;i<len(rf.peers);i++ {
+				rf.nextIndex[i] = log.index
+				rf.matchIndex[i] = 0
+			}
+		}
+		defer rf.mu.Unlock()
 	}
 }
 
@@ -378,5 +448,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.checkHeartbeat()
+	go rf.sendHeartbeat()
 	return rf
 }
