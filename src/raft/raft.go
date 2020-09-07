@@ -62,6 +62,7 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	rpcId int32
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -136,6 +137,7 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
+	RpcId int32
 	// Your data here (2A, 2B).
 	Term         int
 	CandidateId  int
@@ -144,8 +146,8 @@ type RequestVoteArgs struct {
 }
 
 func (args *RequestVoteArgs) String() string {
-	return fmt.Sprintf("req(term=%d, candId=%d, logIndex=%d, logTerm=%d)",
-		args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+	return fmt.Sprintf("req(rpcId=%d, term=%d, candId=%d, logIndex=%d, logTerm=%d)",
+		args.RpcId, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 }
 
 //
@@ -250,7 +252,13 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rpcId := atomic.AddInt32(&rf.rpcId, 1)
+	DPrintf("send request vote. id:%d, X%d -> X%d", rpcId, rf.me, server)
+	now := time.Now()
+	args.RpcId = rpcId
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	dur := time.Now().Sub(now)
+	DPrintf("send request vote. id:%d time:%d ms", rpcId, dur.Milliseconds())
 	return ok
 }
 
@@ -426,6 +434,8 @@ func (rf *Raft) electLeader() {
 		rf.isLeader = true
 		isLeader = true
 		DPrintf("X%d: I am leader now, propose term = %d, now term = %d", rf.me, proposeTerm, rf.currentTerm)
+	} else {
+		DPrintf("X%d: got votes %d, skipped", rf.me, votes)
 	}
 	rf.mu.Unlock()
 
@@ -455,6 +465,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.rpcId = int32(me+1) * 1000
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.logs = []LogEntry{
