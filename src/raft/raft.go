@@ -344,7 +344,6 @@ func (rf *Raft) checkHeartbeat() {
 		electionRandom  = 100
 	)
 	rf.electLeader()
-
 	for {
 		if rf.killed() {
 			break
@@ -415,20 +414,19 @@ func (rf *Raft) electLeader() {
 	}
 	wg.Wait()
 
-	rf.mu.Lock()
 	maxTerm := proposeTerm
 	for i := 0; i < len(rf.peers); i++ {
 		maxTerm = max(maxTerm, maxTerms[i])
 	}
-	rf.currentTerm = max(rf.currentTerm, maxTerm)
 
+	rf.mu.Lock()
+	rf.currentTerm = max(rf.currentTerm, maxTerm)
 	isLeader := false
 	if int(votes) > (len(rf.peers) / 2) {
 		rf.isLeader = true
 		isLeader = true
-		DPrintf("X%d: I am leader now, term = %d", rf.me, proposeTerm)
+		DPrintf("X%d: I am leader now, propose term = %d, now term = %d", rf.me, proposeTerm, rf.currentTerm)
 	}
-
 	rf.mu.Unlock()
 
 	if isLeader {
