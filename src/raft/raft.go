@@ -68,8 +68,8 @@ type Raft struct {
 	isLeader    bool
 	lasthb      time.Time
 	logs        []LogEntry
-	currentTerm int
-	votedFor    int
+	currentTerm int // last term server has ever seen
+	votedFor    int // candidate voted in current term
 	commitIndex int
 	lastApplied int
 	nextIndex   []int
@@ -167,6 +167,11 @@ func (rf *Raft) lastLogEntry() *LogEntry {
 	return &rf.logs[sz-1]
 }
 
+func (rf *Raft) lastLogInfo() (term int, index int) {
+	log := rf.lastLogEntry()
+	return log.term, log.index
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -178,26 +183,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	if args.Term >= rf.currentTerm {
-		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-			log := rf.lastLogEntry()
-			if (args.LastLogTerm > log.term) ||
-				(args.LastLogTerm == log.term && args.LastLogIndex >= log.index) {
-				rf.votedFor = args.CandidateId
-				reply.VoteGranted = true
-			}
+	if args.Term < rf.currentTerm {
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.votedFor = -1
+	}
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		lastTerm, lastIndex := rf.lastLogInfo()
+		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex) {
+			DPrintf("X%d: voted for %d", rf.me, args.CandidateId)
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
 		}
 	}
 	DPrintf("X%d: RequestVote: %v -> %v", rf.me, args, reply)
 }
 
 type AppendEntriesRequest struct {
-	SenderId int
-	Term     int
-}
-
-func (req *AppendEntriesRequest) String() string {
-	return fmt.Sprintf("req(sender=%d, term=%d)", req.SenderId, req.Term)
 }
 
 type AppendEntriesReply struct {
@@ -206,13 +209,6 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	// DPrintf("X%d: AppendEntries: %v -> %v", rf.me, req, reply)
-
-	if req.Term < rf.currentTerm {
-		return
-	}
-	rf.currentTerm = req.Term
 	rf.lasthb = time.Now()
 }
 
@@ -304,11 +300,8 @@ func sleepMills(v int) {
 	time.Sleep(time.Duration(v) * time.Millisecond)
 }
 
-func (rf *Raft) sendHeartbeat(currentTerm int) {
-	req := AppendEntriesRequest{
-		SenderId: rf.me,
-		Term:     currentTerm,
-	}
+func (rf *Raft) sendHeartbeat() {
+	req := AppendEntriesRequest{}
 	reply := AppendEntriesReply{}
 	for i := 0; i < len(rf.peers); i++ {
 		rf.sendAppendEntries(i, &req, &reply)
@@ -316,15 +309,15 @@ func (rf *Raft) sendHeartbeat(currentTerm int) {
 }
 
 func (rf *Raft) keepHeartbeat() {
-	const checkInterval = 50
+	const checkInterval = 30
 	for {
 		if rf.killed() {
 			break
 		}
 
-		term, isLeader := rf.GetState()
+		_, isLeader := rf.GetState()
 		if isLeader {
-			rf.sendHeartbeat(term)
+			rf.sendHeartbeat()
 		}
 		sleepMills(checkInterval)
 	}
@@ -332,9 +325,9 @@ func (rf *Raft) keepHeartbeat() {
 
 func (rf *Raft) checkHeartbeat() {
 	const (
-		checkInterval   = 50
-		electionTimeout = 300
-		electionRandom  = 10
+		checkInterval   = 30
+		electionTimeout = 200
+		electionRandom  = 50
 	)
 	rf.electLeader()
 
@@ -377,40 +370,46 @@ func (rf *Raft) electLeader() {
 
 	rf.mu.Lock()
 	req.Term = rf.currentTerm
+	maxTerm := rf.currentTerm
 	req.CandidateId = rf.me
-	log := rf.lastLogEntry()
-	lastLogIndex := log.index
-	req.LastLogIndex = lastLogIndex
-	req.LastLogTerm = log.term
-	rf.votedFor = -1
+	lastTerm, lastIndex := rf.lastLogInfo()
+	req.LastLogIndex = lastIndex
+	req.LastLogTerm = lastTerm
 	rf.isLeader = false
 	rf.mu.Unlock()
 
 	DPrintf("X%d: electLeader ...", rf.me)
-	maxCurrentTerm := 0
 	votes := 0
 	for i := 0; i < len(rf.peers); i++ {
 		reply := RequestVoteReply{}
-		rf.sendRequestVote(i, &req, &reply)
-		maxCurrentTerm = max(maxCurrentTerm, reply.Term)
-		if reply.VoteGranted {
-			votes += 1
+		if rf.sendRequestVote(i, &req, &reply) {
+			maxTerm = max(maxTerm, reply.Term)
+			if reply.VoteGranted {
+				votes += 1
+			}
 		}
 	}
 
+	isLeader := false
+	term := 0
+	rf.mu.Lock()
 	if votes > (len(rf.peers) / 2) {
-		rf.mu.Lock()
 		rf.isLeader = true
-		rf.currentTerm = maxCurrentTerm + 1
-		currentTerm := rf.currentTerm
-		rf.mu.Unlock()
+		isLeader = true
+		rf.currentTerm = maxTerm + 1
+	} else {
+		rf.currentTerm = maxTerm
+	}
+	term = rf.currentTerm
+	rf.mu.Unlock()
 
-		DPrintf("X%d: I am leader now, term = %d", rf.me, currentTerm)
+	if isLeader {
+		DPrintf("X%d: I am leader now, term = %d", rf.me, term)
 		for i := 0; i < len(rf.peers); i++ {
-			rf.nextIndex[i] = lastLogIndex
+			rf.nextIndex[i] = lastIndex
 			rf.matchIndex[i] = 0
 		}
-		rf.sendHeartbeat(currentTerm)
+		rf.sendHeartbeat()
 	}
 }
 
