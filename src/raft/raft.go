@@ -184,20 +184,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 
 	if args.Term < rf.currentTerm {
+		DPrintf("X%d: RequestVote: %v >>>>>> skipped <<<<<<. rf.currentTerm = %d", rf.me, args, rf.currentTerm)
 		return
 	}
+
 	if args.Term > rf.currentTerm {
+		rf.isLeader = false
 		rf.votedFor = -1
+		rf.currentTerm = args.Term
 	}
+
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastTerm, lastIndex := rf.lastLogInfo()
 		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex) {
-			DPrintf("X%d: voted for %d", rf.me, args.CandidateId)
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 		}
 	}
-	DPrintf("X%d: RequestVote: %v -> %v", rf.me, args, reply)
+	extra := ""
+	if reply.VoteGranted {
+		extra += fmt.Sprintf("voted for %d", args.CandidateId)
+	}
+	DPrintf("X%d: RequestVote: %v -> %v %s", rf.me, args, reply, extra)
 }
 
 type AppendEntriesRequest struct {
@@ -303,13 +311,19 @@ func sleepMills(v int) {
 func (rf *Raft) sendHeartbeat() {
 	req := AppendEntriesRequest{}
 	reply := AppendEntriesReply{}
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
-		rf.sendAppendEntries(i, &req, &reply)
+		go func(peer int) {
+			rf.sendAppendEntries(peer, &req, &reply)
+			wg.Done()
+		}(i)
 	}
+	wg.Wait()
 }
 
 func (rf *Raft) keepHeartbeat() {
-	const checkInterval = 30
+	const checkInterval = 150
 	for {
 		if rf.killed() {
 			break
@@ -325,9 +339,9 @@ func (rf *Raft) keepHeartbeat() {
 
 func (rf *Raft) checkHeartbeat() {
 	const (
-		checkInterval   = 30
-		electionTimeout = 200
-		electionRandom  = 50
+		checkInterval   = 50
+		electionTimeout = 300
+		electionRandom  = 100
 	)
 	rf.electLeader()
 
@@ -352,7 +366,6 @@ func (rf *Raft) checkHeartbeat() {
 		if rf.killed() {
 			break
 		}
-		DPrintf("X%d: lost heartbeat, ready to elect leader", rf.me)
 		rf.electLeader()
 	}
 }
@@ -369,42 +382,56 @@ func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
 	rf.mu.Lock()
+	rf.currentTerm += 1
 	req.Term = rf.currentTerm
-	maxTerm := rf.currentTerm
+	proposeTerm := req.Term
 	req.CandidateId = rf.me
 	lastTerm, lastIndex := rf.lastLogInfo()
 	req.LastLogIndex = lastIndex
 	req.LastLogTerm = lastTerm
+	rf.votedFor = -1
 	rf.isLeader = false
+	rf.lasthb = time.Now()
 	rf.mu.Unlock()
 
 	DPrintf("X%d: electLeader ...", rf.me)
-	votes := 0
+	votes := int32(0)
+	wg := sync.WaitGroup{}
+	wg.Add(len(rf.peers))
+
+	maxTerms := make([]int, len(rf.peers))
+
 	for i := 0; i < len(rf.peers); i++ {
-		reply := RequestVoteReply{}
-		if rf.sendRequestVote(i, &req, &reply) {
-			maxTerm = max(maxTerm, reply.Term)
-			if reply.VoteGranted {
-				votes += 1
+		go func(peer int) {
+			reply := RequestVoteReply{}
+			if rf.sendRequestVote(peer, &req, &reply) {
+				if reply.VoteGranted {
+					atomic.AddInt32(&votes, 1)
+				}
+				maxTerms[peer] = reply.Term
 			}
-		}
+			wg.Done()
+		}(i)
 	}
+	wg.Wait()
+
+	rf.mu.Lock()
+	maxTerm := proposeTerm
+	for i := 0; i < len(rf.peers); i++ {
+		maxTerm = max(maxTerm, maxTerms[i])
+	}
+	rf.currentTerm = max(rf.currentTerm, maxTerm)
 
 	isLeader := false
-	term := 0
-	rf.mu.Lock()
-	if votes > (len(rf.peers) / 2) {
+	if int(votes) > (len(rf.peers) / 2) {
 		rf.isLeader = true
 		isLeader = true
-		rf.currentTerm = maxTerm + 1
-	} else {
-		rf.currentTerm = maxTerm
+		DPrintf("X%d: I am leader now, term = %d", rf.me, proposeTerm)
 	}
-	term = rf.currentTerm
+
 	rf.mu.Unlock()
 
 	if isLeader {
-		DPrintf("X%d: I am leader now, term = %d", rf.me, term)
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIndex[i] = lastIndex
 			rf.matchIndex[i] = 0
