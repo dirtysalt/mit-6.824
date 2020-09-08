@@ -397,6 +397,7 @@ func (rf *Raft) changeToLeader() {
 		rf.nextIndex[i] = 0
 		rf.matchIndex[i] = 0
 	}
+	rf.sendHeartbeat()
 }
 
 func (rf *Raft) electLeader() {
