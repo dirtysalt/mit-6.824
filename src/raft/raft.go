@@ -52,6 +52,8 @@ type LogEntry struct {
 	index   int
 }
 
+const CheckHeartbeatInterval = 150
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -195,6 +197,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
+	// now := time.Now()
+	// off := now.Sub(rf.lasthb)
+	// // disregard vote if you think a leader exists.
+	// if off.Milliseconds() < CheckHeartbeatInterval {
+	// 	return
+	// }
+
 	if args.Term < rf.currentTerm {
 		return
 	}
@@ -334,7 +343,6 @@ func (rf *Raft) sendHeartbeat() {
 }
 
 func (rf *Raft) keepHeartbeat() {
-	const checkInterval = 150
 	for {
 		if rf.killed() {
 			break
@@ -344,7 +352,7 @@ func (rf *Raft) keepHeartbeat() {
 		if isLeader {
 			rf.sendHeartbeat()
 		}
-		sleepMills(checkInterval)
+		sleepMills(CheckHeartbeatInterval)
 	}
 }
 
