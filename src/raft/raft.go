@@ -70,6 +70,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	isLeader    bool
 	lasthb      time.Time
+	lasthbLeader time.Time
 	logs        []LogEntry
 	currentTerm int // last term server has ever seen
 	votedFor    int // candidate voted in current term
@@ -197,12 +198,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	// now := time.Now()
-	// off := now.Sub(rf.lasthb)
-	// // disregard vote if you think a leader exists.
-	// if off.Milliseconds() < CheckHeartbeatInterval / 2 {
-	// 	return
-	// }
+	now := time.Now()
+	off := now.Sub(rf.lasthbLeader)
+	// disregard vote if you think a leader exists.
+	if off.Milliseconds() < CheckHeartbeatInterval {
+		return
+	}
 
 	if args.Term < rf.currentTerm {
 		return
@@ -236,7 +237,9 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
-	rf.lasthb = time.Now()
+	now := time.Now()
+	rf.lasthb = now
+	rf.lasthbLeader = now
 }
 
 //
