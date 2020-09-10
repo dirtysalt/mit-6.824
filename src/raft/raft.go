@@ -200,7 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// now := time.Now()
 	// off := now.Sub(rf.lasthb)
 	// // disregard vote if you think a leader exists.
-	// if off.Milliseconds() < CheckHeartbeatInterval {
+	// if off.Milliseconds() < CheckHeartbeatInterval / 2 {
 	// 	return
 	// }
 
