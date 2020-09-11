@@ -18,12 +18,13 @@ package raft
 //
 
 import (
-	"../labrpc"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"../labrpc"
 )
 
 // import "bytes"
@@ -47,9 +48,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	command interface{}
-	term    int
-	index   int
+	Command interface{}
+	Term    int
 }
 
 const CheckHeartbeatInterval = 150
@@ -63,21 +63,25 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	cond      *sync.Cond
+	applyCh   chan ApplyMsg
 
 	rpcId int32
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	isLeader    bool
-	lasthb      time.Time
+	isLeader     bool
+	lasthb       time.Time
 	lasthbLeader time.Time
-	logs        []LogEntry
-	currentTerm int // last term server has ever seen
-	votedFor    int // candidate voted in current term
-	commitIndex int
-	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
+	logs         []LogEntry
+	currentTerm  int // last term server has ever seen
+	votedFor     int // candidate voted in current term
+	commitIndex  int
+	lastApplied  int
+	baseIndex    int
+	lastIndex    int
+	nextIndex    []int
+	matchIndex   []int
 }
 
 func (rf *Raft) GetRpcId() int32 {
@@ -182,9 +186,9 @@ func (rf *Raft) lastLogEntry() *LogEntry {
 	return &rf.logs[sz-1]
 }
 
-func (rf *Raft) lastLogInfo() (term int, index int) {
+func (rf *Raft) lastLogTerm() (term int) {
 	log := rf.lastLogEntry()
-	return log.term, log.index
+	return log.Term
 }
 
 //
@@ -214,8 +218,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		lastTerm, lastIndex := rf.lastLogInfo()
-		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex) {
+		lastTerm := rf.lastLogTerm()
+		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= rf.lastIndex) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 		}
@@ -229,6 +233,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesRequest struct {
+	Heartbeat bool
 }
 
 type AppendEntriesReply struct {
@@ -240,6 +245,10 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	now := time.Now()
 	rf.lasthb = now
 	rf.lasthbLeader = now
+
+	if req.Heartbeat {
+		return
+	}
 }
 
 //
@@ -306,6 +315,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.Lock()
+	defer rf.Unlock()
+
+	isLeader = rf.isLeader
+	term = rf.currentTerm
+
+	if isLeader {
+		rf.lastIndex = rf.lastIndex + 1
+		index = rf.lastIndex
+		log := LogEntry{
+			Command: command,
+			Term:    term,
+		}
+		rf.logs = append(rf.logs, log)
+		// TODO: send log out.
+	}
 
 	return index, term, isLeader
 }
@@ -323,6 +348,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.cond.Broadcast()
 	// Your code here, if desired.
 }
 
@@ -336,7 +362,7 @@ func sleepMills(v int) {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	req := AppendEntriesRequest{}
+	req := AppendEntriesRequest{Heartbeat: true}
 	reply := AppendEntriesReply{}
 	for i := 0; i < len(rf.peers); i++ {
 		go func(peer int) {
@@ -411,6 +437,35 @@ func (rf *Raft) changeToLeader() {
 	rf.sendHeartbeat()
 }
 
+func (rf *Raft) checkProgress() {
+	for {
+		if rf.killed() {
+			break
+		}
+		rf.Lock()
+		for rf.commitIndex <= rf.lastApplied {
+			rf.cond.Wait()
+		}
+
+		if rf.killed() {
+			break
+		}
+
+		for i := rf.lastApplied + 1; i < rf.commitIndex; i++ {
+			log := &rf.logs[i-rf.baseIndex]
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      log.Command,
+				CommandIndex: i,
+			}
+			rf.applyCh <- msg
+		}
+		rf.lastApplied = rf.commitIndex
+
+		rf.Unlock()
+	}
+}
+
 func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
@@ -418,9 +473,8 @@ func (rf *Raft) electLeader() {
 	rf.currentTerm += 1
 	req.Term = rf.currentTerm
 	req.CandidateId = rf.me
-	lastTerm, lastIndex := rf.lastLogInfo()
-	req.LastLogIndex = lastIndex
-	req.LastLogTerm = lastTerm
+	req.LastLogIndex = rf.lastIndex
+	req.LastLogTerm = rf.lastLogTerm()
 	req.RpcId = rf.GetRpcId()
 	rf.votedFor = -1
 	rf.isLeader = false
@@ -469,15 +523,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.rpcId = int32(me+1) * 1000
+	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.logs = []LogEntry{
 		LogEntry{
-			command: nil,
-			term:    0,
-			index:   0,
+			Command: nil,
+			Term:    0,
 		},
 	}
+	rf.baseIndex = 0
+	rf.lastIndex = 0
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.isLeader = false
@@ -491,5 +548,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go rf.checkHeartbeat()
 	go rf.keepHeartbeat()
+	go rf.checkProgress()
 	return rf
 }
