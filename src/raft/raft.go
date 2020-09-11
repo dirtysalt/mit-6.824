@@ -71,6 +71,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	isLeader     bool
+	leaderId     int
 	lasthb       time.Time
 	lasthbLeader time.Time
 	logs         []LogEntry
@@ -216,6 +217,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.isLeader = false
 		rf.votedFor = -1
 		rf.currentTerm = args.Term
+		rf.leaderId = -1
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastTerm := rf.lastLogTerm()
@@ -233,15 +235,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesRequest struct {
-	Heartbeat bool
+	Heartbeat         bool
+	Term              int
+	LeaderId          int
+	PrevLogIndex      int
+	PrevLogTerm       int
+	entries           []LogEntry
+	LeaderCommitIndex int
 }
 
 type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
+	if req.Term < rf.currentTerm && !req.Heartbeat {
+		return
+	}
+
 	now := time.Now()
 	rf.lasthb = now
 	rf.lasthbLeader = now
@@ -249,6 +263,23 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	if req.Heartbeat {
 		return
 	}
+	reply.Success = false
+	reply.Term = rf.currentTerm
+	rf.currentTerm = max(rf.currentTerm, req.Term)
+	rf.leaderId = req.LeaderId
+	if req.LeaderCommitIndex > rf.commitIndex {
+		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastIndex)
+	}
+
+	idx := req.PrevLogIndex - rf.baseIndex
+	term := rf.logs[idx].Term
+	if term != req.PrevLogTerm {
+		DPrintf("mismatch log entry. index = %v, leader term = %v, my term = %v", req.PrevLogIndex, req.PrevLogTerm, term)
+		return
+	}
+	// TODO:
+	reply.Success = true
+	return
 }
 
 //
@@ -423,6 +454,15 @@ func max(a, b int) int {
 		return b
 	}
 }
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+
 func (rf *Raft) changeToLeader() {
 	rf.Lock()
 	defer rf.Unlock()
