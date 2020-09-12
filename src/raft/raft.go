@@ -79,8 +79,8 @@ type Raft struct {
 	votedFor     int // candidate voted in current term
 	commitIndex  int
 	lastApplied  int
-	baseIndex    int
-	lastIndex    int
+	baseLogIndex int
+	lastLogIndex int
 	nextIndex    []int
 	matchIndex   []int
 }
@@ -221,7 +221,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastTerm := rf.lastLogTerm()
-		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= rf.lastIndex) {
+		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= rf.lastLogIndex) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 		}
@@ -240,7 +240,7 @@ type AppendEntriesRequest struct {
 	LeaderId          int
 	PrevLogIndex      int
 	PrevLogTerm       int
-	entries           []LogEntry
+	Entries           []LogEntry
 	LeaderCommitIndex int
 }
 
@@ -268,10 +268,10 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	rf.currentTerm = max(rf.currentTerm, req.Term)
 	rf.leaderId = req.LeaderId
 	if req.LeaderCommitIndex > rf.commitIndex {
-		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastIndex)
+		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastLogIndex)
 	}
 
-	idx := req.PrevLogIndex - rf.baseIndex
+	idx := req.PrevLogIndex - rf.baseLogIndex
 	term := rf.logs[idx].Term
 	if term != req.PrevLogTerm {
 		DPrintf("mismatch log entry. index = %v, leader term = %v, my term = %v", req.PrevLogIndex, req.PrevLogTerm, term)
@@ -353,14 +353,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 
 	if isLeader {
-		rf.lastIndex = rf.lastIndex + 1
-		index = rf.lastIndex
+		rf.lastLogIndex = rf.lastLogIndex + 1
+		index = rf.lastLogIndex
 		log := LogEntry{
 			Command: command,
 			Term:    term,
 		}
 		rf.logs = append(rf.logs, log)
-		// TODO: send log out.
+		// wait `checkCommitProgress` to update
 	}
 
 	return index, term, isLeader
@@ -477,7 +477,7 @@ func (rf *Raft) changeToLeader() {
 	rf.sendHeartbeat()
 }
 
-func (rf *Raft) checkProgress() {
+func (rf *Raft) checkApplyProgress() {
 	for {
 		if rf.killed() {
 			break
@@ -492,7 +492,7 @@ func (rf *Raft) checkProgress() {
 		}
 
 		for i := rf.lastApplied + 1; i < rf.commitIndex; i++ {
-			log := &rf.logs[i-rf.baseIndex]
+			log := &rf.logs[i-rf.baseLogIndex]
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      log.Command,
@@ -506,6 +506,9 @@ func (rf *Raft) checkProgress() {
 	}
 }
 
+func (rf *Raft) checkCommitProgress() {
+}
+
 func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
@@ -513,7 +516,7 @@ func (rf *Raft) electLeader() {
 	rf.currentTerm += 1
 	req.Term = rf.currentTerm
 	req.CandidateId = rf.me
-	req.LastLogIndex = rf.lastIndex
+	req.LastLogIndex = rf.lastLogIndex
 	req.LastLogTerm = rf.lastLogTerm()
 	req.RpcId = rf.GetRpcId()
 	rf.votedFor = -1
@@ -573,8 +576,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			Term:    0,
 		},
 	}
-	rf.baseIndex = 0
-	rf.lastIndex = 0
+	rf.baseLogIndex = 0
+	rf.lastLogIndex = 0
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.isLeader = false
@@ -588,6 +591,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go rf.checkHeartbeat()
 	go rf.keepHeartbeat()
-	go rf.checkProgress()
+	go rf.checkApplyProgress()
+	go rf.checkCommitProgress()
 	return rf
 }
