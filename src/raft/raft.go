@@ -20,6 +20,7 @@ package raft
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,13 +59,14 @@ const CheckHeartbeatInterval = 150
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
-	cond      *sync.Cond
-	applyCh   chan ApplyMsg
+	mu         sync.Mutex          // Lock to protect shared access to this peer's state
+	peers      []*labrpc.ClientEnd // RPC end points of all peers
+	persister  *Persister          // Object to hold this peer's persisted state
+	me         int                 // this peer's index into peers[]
+	dead       int32               // set by Kill()
+	applyCond  *sync.Cond
+	commitCond *sync.Cond
+	applyCh    chan ApplyMsg
 
 	rpcId int32
 	// Your data here (2A, 2B, 2C).
@@ -379,7 +381,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	rf.cond.Broadcast()
+	rf.applyCond.Broadcast()
+	rf.commitCond.Broadcast()
 	// Your code here, if desired.
 }
 
@@ -483,30 +486,58 @@ func (rf *Raft) checkApplyProgress() {
 			break
 		}
 		rf.Lock()
-		for rf.commitIndex <= rf.lastApplied {
-			rf.cond.Wait()
-		}
-
-		if rf.killed() {
-			break
-		}
-
-		for i := rf.lastApplied + 1; i < rf.commitIndex; i++ {
-			log := &rf.logs[i-rf.baseLogIndex]
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      log.Command,
-				CommandIndex: i,
+		for {
+			if rf.killed() {
+				break
 			}
-			rf.applyCh <- msg
+			DPrintf("X%d commit-index = %d, last-applied = %d", rf.me, rf.commitIndex, rf.lastApplied)
+			if rf.commitIndex <= rf.lastApplied {
+				rf.applyCond.Wait()
+			} else {
+				for i := rf.lastApplied + 1; i < rf.commitIndex; i++ {
+					log := &rf.logs[i-rf.baseLogIndex]
+					msg := ApplyMsg{
+						CommandValid: true,
+						Command:      log.Command,
+						CommandIndex: i,
+					}
+					rf.applyCh <- msg
+				}
+				rf.lastApplied = rf.commitIndex
+			}
 		}
-		rf.lastApplied = rf.commitIndex
-
 		rf.Unlock()
 	}
 }
 
+func (rf *Raft) maxReplicateIndex() int {
+	match := make([]int, len(rf.peers))
+	sort.Sort(sort.IntSlice(match))
+	return match[len(rf.peers)/2]
+}
+
 func (rf *Raft) checkCommitProgress() {
+	for {
+		if rf.killed() {
+			break
+		}
+		rf.Lock()
+		for {
+			if rf.killed() {
+				break
+			}
+			maxReplIndex := rf.maxReplicateIndex()
+			DPrintf("X%d max-repl-index = %d, commit-index = %d", rf.me, maxReplIndex, rf.commitIndex)
+			if maxReplIndex <= rf.commitIndex {
+				rf.commitCond.Wait()
+			} else {
+				rf.commitIndex = maxReplIndex
+				rf.applyCond.Signal()
+				break
+			}
+		}
+		rf.Unlock()
+	}
 }
 
 func (rf *Raft) electLeader() {
@@ -566,8 +597,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.rpcId = int32(me+1) * 1000
-	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.applyCh = applyCh
+	rf.commitCond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.logs = []LogEntry{
