@@ -194,6 +194,18 @@ func (rf *Raft) lastLogTerm() (term int) {
 	return log.Term
 }
 
+func (rf *Raft) getLogEntry(index int) *LogEntry {
+	log := &rf.logs[index-rf.baseLogIndex]
+	return log
+}
+
+func (rf *Raft) toFollower(term int) {
+	rf.isLeader = false
+	rf.votedFor = -1
+	rf.currentTerm = term
+	rf.leaderId = -1
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -216,10 +228,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.isLeader = false
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
-		rf.leaderId = -1
+		rf.toFollower(args.Term)
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastTerm := rf.lastLogTerm()
@@ -254,7 +263,10 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
-	if req.Term < rf.currentTerm && !req.Heartbeat {
+	reply.Success = false
+	reply.Term = rf.currentTerm
+
+	if !req.Heartbeat && req.Term < rf.currentTerm {
 		return
 	}
 
@@ -265,8 +277,6 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	if req.Heartbeat {
 		return
 	}
-	reply.Success = false
-	reply.Term = rf.currentTerm
 	rf.currentTerm = max(rf.currentTerm, req.Term)
 	rf.leaderId = req.LeaderId
 	if req.LeaderCommitIndex > rf.commitIndex {
@@ -280,6 +290,10 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		return
 	}
 	// TODO:
+	// replace existed part
+	// start := idx + 1
+	// end := start + len(rf.logs)
+
 	reply.Success = true
 	return
 }
@@ -362,6 +376,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 		}
 		rf.logs = append(rf.logs, log)
+		rf.nextIndex[rf.me] = rf.lastLogIndex + 1
+		rf.matchIndex[rf.me] = rf.lastLogIndex
 		// wait `checkCommitProgress` to update
 	}
 
@@ -396,10 +412,13 @@ func sleepMills(v int) {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	req := AppendEntriesRequest{Heartbeat: true}
-	reply := AppendEntriesReply{}
+	req := AppendEntriesRequest{
+		Heartbeat: true,
+		Term:      rf.currentTerm,
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		go func(peer int) {
+			reply := AppendEntriesReply{}
 			rf.sendAppendEntries(peer, &req, &reply)
 		}(i)
 	}
@@ -413,7 +432,9 @@ func (rf *Raft) keepHeartbeat() {
 
 		_, isLeader := rf.GetState()
 		if isLeader {
+			rf.Lock()
 			rf.sendHeartbeat()
+			rf.Unlock()
 		}
 		sleepMills(CheckHeartbeatInterval)
 	}
@@ -474,10 +495,70 @@ func (rf *Raft) changeToLeader() {
 	DPrintf("X%d: I am leader now, term = %d", rf.me, rf.currentTerm)
 
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = 0
+		rf.nextIndex[i] = rf.lastLogIndex + 1
 		rf.matchIndex[i] = 0
 	}
 	rf.sendHeartbeat()
+}
+
+func (rf *Raft) checkReplProgress(peer int) {
+	const (
+		checkReplInterval = 100
+	)
+	for {
+		if rf.killed() {
+			break
+		}
+
+		rf.Lock()
+		if !rf.isLeader || rf.me == peer {
+			rf.Unlock()
+			sleepMills(checkReplInterval)
+			continue
+		}
+
+		if rf.nextIndex[peer] > rf.lastLogIndex {
+			rf.Unlock()
+			sleepMills(checkReplInterval)
+			continue
+		}
+
+		prevIndex := rf.nextIndex[peer] - 1
+		lastIndex := rf.lastLogIndex
+
+		prevLog := rf.getLogEntry(prevIndex)
+		req := AppendEntriesRequest{
+			Heartbeat:         false,
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			PrevLogIndex:      prevIndex,
+			PrevLogTerm:       prevLog.Term,
+			LeaderCommitIndex: rf.commitIndex,
+			Entries:           rf.logs[prevIndex+1-rf.baseLogIndex : lastIndex+1-rf.baseLogIndex],
+		}
+		reply := AppendEntriesReply{}
+		rf.Unlock()
+
+		if !rf.sendAppendEntries(peer, &req, &reply) {
+			sleepMills(checkReplInterval)
+			continue
+		}
+
+		rf.Lock()
+		if !reply.Success {
+			if reply.Term > req.Term {
+				rf.toFollower(reply.Term)
+			} else {
+				// term confliction
+				rf.nextIndex[peer] -= 1
+			}
+		} else {
+			// accept logs[prevIndex+1:lastIndex+1]
+			rf.nextIndex[peer] = lastIndex + 1
+			rf.matchIndex[peer] = lastIndex
+		}
+		rf.Unlock()
+	}
 }
 
 func (rf *Raft) checkApplyProgress() {
@@ -494,8 +575,8 @@ func (rf *Raft) checkApplyProgress() {
 			if rf.commitIndex <= rf.lastApplied {
 				rf.applyCond.Wait()
 			} else {
-				for i := rf.lastApplied + 1; i < rf.commitIndex; i++ {
-					log := &rf.logs[i-rf.baseLogIndex]
+				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+					log := rf.getLogEntry(i)
 					msg := ApplyMsg{
 						CommandValid: true,
 						Command:      log.Command,
@@ -533,7 +614,6 @@ func (rf *Raft) checkCommitProgress() {
 			} else {
 				rf.commitIndex = maxReplIndex
 				rf.applyCond.Signal()
-				break
 			}
 		}
 		rf.Unlock()
@@ -625,5 +705,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.keepHeartbeat()
 	go rf.checkApplyProgress()
 	go rf.checkCommitProgress()
+	for i := 0; i < len(rf.peers); i++ {
+		go rf.checkReplProgress(i)
+	}
 	return rf
 }
