@@ -337,7 +337,7 @@ loop:
 	cfg.end()
 }
 
-func TestRejoin2XB(t *testing.T) {
+func TestRejoin2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -349,6 +349,7 @@ func TestRejoin2XB(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	DPrintf("disconnect leader X%d", leader1)
 
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
@@ -361,8 +362,10 @@ func TestRejoin2XB(t *testing.T) {
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
+	DPrintf("disconnect leader X%d", leader2)
 
 	// old leader connected again
+	DPrintf("reconnect leader X%d", leader1)
 	cfg.connect(leader1)
 
 	cfg.one(104, 2, true)

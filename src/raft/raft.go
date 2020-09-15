@@ -48,6 +48,10 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+func (msg *ApplyMsg) String() string {
+	return fmt.Sprintf("ApplyMsg(valid=%v, command=%v, index=%d)", msg.CommandValid, msg.Command, msg.CommandIndex)
+}
+
 type LogEntry struct {
 	Command interface{}
 	Term    int
@@ -246,7 +250,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesRequest struct {
-	Heartbeat         bool
 	Term              int
 	LeaderId          int
 	PrevLogIndex      int
@@ -256,8 +259,9 @@ type AppendEntriesRequest struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term     int
+	Success  bool
+	Conflict bool
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
@@ -265,27 +269,20 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	defer rf.Unlock()
 	reply.Success = false
 	reply.Term = rf.currentTerm
+	reply.Conflict = false
 
-	if !req.Heartbeat && req.Term < rf.currentTerm {
+	if req.Term < rf.currentTerm {
 		return
 	}
 
 	now := time.Now()
 	rf.lasthb = now
 	rf.lasthbLeader = now
-
+	if req.Term > rf.currentTerm {
+		rf.toFollower(req.Term)
+	}
 	rf.currentTerm = max(rf.currentTerm, req.Term)
 	rf.leaderId = req.LeaderId
-	if req.LeaderCommitIndex > rf.commitIndex {
-		DPrintf("X%d: update commit index %d->%d(%d)", rf.me, rf.commitIndex, req.LeaderCommitIndex, rf.lastLogIndex)
-		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastLogIndex)
-		rf.applyCond.Signal()
-	}
-
-	// 使用心跳同样可以同步commitIndex和currentTerm
-	if req.Heartbeat {
-		return
-	}
 
 	idx := req.PrevLogIndex - rf.baseLogIndex
 	if idx >= len(rf.logs) || rf.logs[idx].Term != req.PrevLogTerm {
@@ -294,21 +291,33 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		} else {
 			DPrintf("X%d: mismatch log entry. too short", rf.me)
 		}
+		reply.Conflict = true
 		return
 	}
+
 	idx += 1
-	DPrintf("X%d: append logs at [%d,%d]", rf.me, idx, idx+len(req.Entries)-1)
-	// TODO: append logs
-	for i := 0; i < len(req.Entries); i++ {
-		if len(rf.logs) == idx {
-			rf.logs = append(rf.logs, req.Entries[i])
-		} else {
-			rf.logs[idx] = req.Entries[i]
+	if len(req.Entries) != 0 {
+		DPrintf("X%d: append logs at [%d,%d]", rf.me, idx, idx+len(req.Entries)-1)
+		// TODO: append logs
+		for i := 0; i < len(req.Entries); i++ {
+			if len(rf.logs) == idx {
+				rf.logs = append(rf.logs, req.Entries[i])
+			} else {
+				rf.logs[idx] = req.Entries[i]
+			}
+			idx += 1
 		}
-		idx += 1
 	}
 	rf.logs = rf.logs[:idx]
 	rf.lastLogIndex = idx - 1
+
+	// 这里更新commitIndex前提是logs已经完全一致了
+	if req.LeaderCommitIndex > rf.commitIndex {
+		DPrintf("X%d: update commit index %d->%d(%d)", rf.me, rf.commitIndex, req.LeaderCommitIndex, rf.lastLogIndex)
+		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastLogIndex)
+		rf.applyCond.Signal()
+	}
+
 	reply.Success = true
 	return
 }
@@ -428,15 +437,33 @@ func sleepMills(v int) {
 }
 
 func (rf *Raft) sendHeartbeat() {
+	prevIndex := rf.lastLogIndex
+	prevLog := rf.getLogEntry(prevIndex)
+
 	req := AppendEntriesRequest{
-		Heartbeat:         true,
 		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		PrevLogIndex:      prevIndex,
+		PrevLogTerm:       prevLog.Term,
 		LeaderCommitIndex: rf.commitIndex,
+		Entries:           []LogEntry{},
 	}
 	for i := 0; i < len(rf.peers); i++ {
 		go func(peer int) {
 			reply := AppendEntriesReply{}
-			rf.sendAppendEntries(peer, &req, &reply)
+			if rf.sendAppendEntries(peer, &req, &reply) {
+				if !reply.Success {
+					rf.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.toFollower(reply.Term)
+					}
+					if reply.Conflict {
+						// term confliction
+						rf.nextIndex[peer] = prevIndex
+					}
+					rf.Unlock()
+				}
+			}
 		}(i)
 	}
 }
@@ -545,7 +572,6 @@ func (rf *Raft) checkReplProgress(peer int) {
 
 		prevLog := rf.getLogEntry(prevIndex)
 		req := AppendEntriesRequest{
-			Heartbeat:         false,
 			Term:              rf.currentTerm,
 			LeaderId:          rf.me,
 			PrevLogIndex:      prevIndex,
@@ -563,11 +589,12 @@ func (rf *Raft) checkReplProgress(peer int) {
 
 		rf.Lock()
 		if !reply.Success {
-			if reply.Term > req.Term {
+			if reply.Term > rf.currentTerm {
 				rf.toFollower(reply.Term)
-			} else {
+			}
+			if reply.Conflict {
 				// term confliction
-				rf.nextIndex[peer] -= 1
+				rf.nextIndex[peer] = prevIndex
 			}
 		} else {
 			// accept logs[prevIndex+1:lastIndex+1]
@@ -602,9 +629,9 @@ func (rf *Raft) checkApplyProgress() {
 						Command:      log.Command,
 						CommandIndex: i,
 					}
-					DPrintf("X%d: msg = %v", rf.me, msg)
+					DPrintf("X%d: commit msg = %v", rf.me, &msg)
 					if rf.isLeader {
-						DPrintf("X%d: Leader Commit. index = %d, msg = %v", rf.me, i, msg)
+						DPrintf("X%d: Leader Commit. index = %d, msg = %v", rf.me, i, &msg)
 					}
 					rf.applyCh <- msg
 				}
