@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -57,7 +59,12 @@ type LogEntry struct {
 	Term    int
 }
 
-const CheckHeartbeatInterval = 150
+const (
+	sendHeartbeatInterval  = 200
+	checkHeartbeatInterval = 50
+	electionTimeout        = 300
+	electionRandom         = 100
+)
 
 //
 // A Go object implementing a single Raft peer.
@@ -132,6 +139,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.logs)
+	e.Encode(rf.lastLogIndex)
+	e.Encode(rf.baseLogIndex)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -154,6 +171,14 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.logs)
+	d.Decode(&rf.lastLogIndex)
+	d.Decode(&rf.baseLogIndex)
 }
 
 //
@@ -224,7 +249,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	now := time.Now()
 	off := now.Sub(rf.lasthbLeader)
 	// disregard vote if you think a leader exists.
-	if off.Milliseconds() < CheckHeartbeatInterval {
+	if off.Milliseconds() < sendHeartbeatInterval {
 		return
 	}
 
@@ -246,6 +271,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if reply.VoteGranted {
 		message += fmt.Sprintf("voted for %d", args.CandidateId)
 	}
+	rf.persist()
 	DPrintf("X%d: RequestVote: %v -> %v %s", rf.me, args, reply, message)
 }
 
@@ -319,6 +345,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	}
 
 	reply.Success = true
+	rf.persist()
 	return
 }
 
@@ -401,9 +428,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs, log)
 		rf.nextIndex[rf.me] = rf.lastLogIndex + 1
 		rf.matchIndex[rf.me] = rf.lastLogIndex
-		rf.commitCond.Signal()
-		DPrintf("X%d: Start command. index = %d, term = %d", rf.me, index, term)
 		// DPrintf("X%d: set next[%d]=%d, match[%d]=%d", rf.me, rf.me, rf.nextIndex[rf.me], rf.me, rf.matchIndex[rf.me])
+		rf.commitCond.Signal()
+		rf.persist()
+		DPrintf("X%d: Start command. index = %d, term = %d", rf.me, index, term)
 	}
 
 	return index, term, isLeader
@@ -480,16 +508,11 @@ func (rf *Raft) keepHeartbeat() {
 			rf.sendHeartbeat()
 			rf.Unlock()
 		}
-		sleepMills(CheckHeartbeatInterval)
+		sleepMills(sendHeartbeatInterval)
 	}
 }
 
 func (rf *Raft) checkHeartbeat() {
-	const (
-		checkInterval   = 50
-		electionTimeout = 300
-		electionRandom  = 100
-	)
 	rf.electLeader()
 	for {
 		if rf.killed() {
@@ -505,7 +528,7 @@ func (rf *Raft) checkHeartbeat() {
 			do = true
 		}
 		if !do {
-			sleepMills(checkInterval)
+			sleepMills(checkHeartbeatInterval)
 			continue
 		}
 		if rf.killed() {
