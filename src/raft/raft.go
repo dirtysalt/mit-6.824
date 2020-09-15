@@ -274,26 +274,41 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	rf.lasthb = now
 	rf.lasthbLeader = now
 
-	if req.Heartbeat {
-		return
-	}
 	rf.currentTerm = max(rf.currentTerm, req.Term)
 	rf.leaderId = req.LeaderId
 	if req.LeaderCommitIndex > rf.commitIndex {
+		DPrintf("X%d: update commit index %d->%d(%d)", rf.me, rf.commitIndex, req.LeaderCommitIndex, rf.lastLogIndex)
 		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastLogIndex)
+		rf.applyCond.Signal()
+	}
+
+	// 使用心跳同样可以同步commitIndex和currentTerm
+	if req.Heartbeat {
+		return
 	}
 
 	idx := req.PrevLogIndex - rf.baseLogIndex
-	term := rf.logs[idx].Term
-	if term != req.PrevLogTerm {
-		DPrintf("mismatch log entry. index = %v, leader term = %v, my term = %v", req.PrevLogIndex, req.PrevLogTerm, term)
+	if idx >= len(rf.logs) || rf.logs[idx].Term != req.PrevLogTerm {
+		if idx < len(rf.logs) {
+			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v", rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
+		} else {
+			DPrintf("X%d: mismatch log entry. too short", rf.me)
+		}
 		return
 	}
-	// TODO:
-	// replace existed part
-	// start := idx + 1
-	// end := start + len(rf.logs)
-
+	idx += 1
+	DPrintf("X%d: append logs at [%d,%d]", rf.me, idx, idx+len(req.Entries)-1)
+	// TODO: append logs
+	for i := 0; i < len(req.Entries); i++ {
+		if len(rf.logs) == idx {
+			rf.logs = append(rf.logs, req.Entries[i])
+		} else {
+			rf.logs[idx] = req.Entries[i]
+		}
+		idx += 1
+	}
+	rf.logs = rf.logs[:idx]
+	rf.lastLogIndex = idx - 1
 	reply.Success = true
 	return
 }
@@ -366,11 +381,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.Unlock()
 
 	isLeader = rf.isLeader
-	term = rf.currentTerm
-
 	if isLeader {
 		rf.lastLogIndex = rf.lastLogIndex + 1
 		index = rf.lastLogIndex
+		term = rf.currentTerm
 		log := LogEntry{
 			Command: command,
 			Term:    term,
@@ -378,7 +392,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs, log)
 		rf.nextIndex[rf.me] = rf.lastLogIndex + 1
 		rf.matchIndex[rf.me] = rf.lastLogIndex
-		// wait `checkCommitProgress` to update
+		rf.commitCond.Signal()
+		DPrintf("X%d: Start command. index = %d, term = %d", rf.me, index, term)
+		// DPrintf("X%d: set next[%d]=%d, match[%d]=%d", rf.me, rf.me, rf.nextIndex[rf.me], rf.me, rf.matchIndex[rf.me])
 	}
 
 	return index, term, isLeader
@@ -413,8 +429,9 @@ func sleepMills(v int) {
 
 func (rf *Raft) sendHeartbeat() {
 	req := AppendEntriesRequest{
-		Heartbeat: true,
-		Term:      rf.currentTerm,
+		Heartbeat:         true,
+		Term:              rf.currentTerm,
+		LeaderCommitIndex: rf.commitIndex,
 	}
 	for i := 0; i < len(rf.peers); i++ {
 		go func(peer int) {
@@ -556,6 +573,8 @@ func (rf *Raft) checkReplProgress(peer int) {
 			// accept logs[prevIndex+1:lastIndex+1]
 			rf.nextIndex[peer] = lastIndex + 1
 			rf.matchIndex[peer] = lastIndex
+			// DPrintf("X%d: set next[%d]=%d, match[%d]=%d", rf.me, peer, rf.nextIndex[peer], peer, rf.matchIndex[peer])
+			rf.commitCond.Signal()
 		}
 		rf.Unlock()
 	}
@@ -571,16 +590,21 @@ func (rf *Raft) checkApplyProgress() {
 			if rf.killed() {
 				break
 			}
-			DPrintf("X%d commit-index = %d, last-applied = %d", rf.me, rf.commitIndex, rf.lastApplied)
+			// DPrintf("X%d: commit-index = %d, last-applied = %d", rf.me, rf.commitIndex, rf.lastApplied)
 			if rf.commitIndex <= rf.lastApplied {
 				rf.applyCond.Wait()
 			} else {
+				DPrintf("X%d: commit logs at [%d,%d]", rf.me, rf.lastApplied+1, rf.commitIndex)
 				for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 					log := rf.getLogEntry(i)
 					msg := ApplyMsg{
 						CommandValid: true,
 						Command:      log.Command,
 						CommandIndex: i,
+					}
+					DPrintf("X%d: msg = %v", rf.me, msg)
+					if rf.isLeader {
+						DPrintf("X%d: Leader Commit. index = %d, msg = %v", rf.me, i, msg)
 					}
 					rf.applyCh <- msg
 				}
@@ -593,7 +617,11 @@ func (rf *Raft) checkApplyProgress() {
 
 func (rf *Raft) maxReplicateIndex() int {
 	match := make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		match[i] = rf.matchIndex[i]
+	}
 	sort.Sort(sort.IntSlice(match))
+	// DPrintf("X%d: match index = %v(%v)", rf.me, match, rf.matchIndex)
 	return match[len(rf.peers)/2]
 }
 
@@ -608,7 +636,7 @@ func (rf *Raft) checkCommitProgress() {
 				break
 			}
 			maxReplIndex := rf.maxReplicateIndex()
-			DPrintf("X%d max-repl-index = %d, commit-index = %d", rf.me, maxReplIndex, rf.commitIndex)
+			// DPrintf("X%d: max-repl-index = %d, commit-index = %d", rf.me, maxReplIndex, rf.commitIndex)
 			if maxReplIndex <= rf.commitIndex {
 				rf.commitCond.Wait()
 			} else {
