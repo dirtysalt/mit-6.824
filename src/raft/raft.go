@@ -742,18 +742,21 @@ func (rf *Raft) electLeader() {
 		go func(peer int) {
 			reply := RequestVoteReply{}
 			if rf.sendRequestVote(peer, &req, &reply) {
+				valid := true
 				rf.Lock()
 				// 如果修改了currentTerm的话，那么认为这轮就失败了
 				// 因为这里投票其实是投给req.Term
 				// 如果这里直接更新了currentTerm的话，那么就会出现两个leader.
 				if reply.Term > rf.currentTerm {
 					rf.toFollower(reply.Term)
-					atomic.StoreInt32(&votes, -1000)
+				}
+				if req.Term != rf.currentTerm {
+					valid = false
 				}
 				rf.Unlock()
 
 				// get majority votes
-				if reply.VoteGranted {
+				if valid && reply.VoteGranted {
 					v := atomic.AddInt32(&votes, 1)
 					if int(v) == (len(rf.peers)/2 + 1) {
 						rf.changeToLeader()
