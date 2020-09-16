@@ -52,7 +52,7 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.end()
 }
 
-func TestReElection2XA(t *testing.T) {
+func TestReElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
