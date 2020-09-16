@@ -60,10 +60,10 @@ type LogEntry struct {
 }
 
 const (
-	sendHeartbeatInterval  = 200
+	sendHeartbeatInterval  = 300
 	checkHeartbeatInterval = 50
 	electionTimeout        = 300
-	electionRandom         = 100
+	electionRandom         = 200
 )
 
 //
