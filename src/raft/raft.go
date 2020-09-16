@@ -278,6 +278,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesRequest struct {
+	Heartbeat         bool
 	Term              int
 	LeaderId          int
 	PrevLogIndex      int
@@ -493,6 +494,7 @@ func (rf *Raft) sendHeartbeat() {
 	prevLog := rf.getLogEntry(prevIndex)
 
 	req := AppendEntriesRequest{
+		Heartbeat:         true,
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
 		PrevLogIndex:      prevIndex,
@@ -618,6 +620,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 			}
 
 			req := AppendEntriesRequest{
+				Heartbeat:         false,
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
 				PrevLogIndex:      prevIndex,
