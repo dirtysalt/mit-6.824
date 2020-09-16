@@ -340,7 +340,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		}
 	}
 	rf.logs = rf.logs[:idx]
-	rf.lastLogIndex = idx - 1
+	rf.lastLogIndex = idx - 1 + rf.baseLogIndex
 
 	// 这里更新commitIndex前提是logs已经完全一致了
 	if req.LeaderCommitIndex > rf.commitIndex {
