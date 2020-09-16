@@ -313,7 +313,6 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	if req.Term > rf.currentTerm {
 		rf.toFollower(req.Term)
 	}
-	rf.currentTerm = max(rf.currentTerm, req.Term)
 	rf.leaderId = req.LeaderId
 
 	idx := req.PrevLogIndex - rf.baseLogIndex
@@ -726,14 +725,15 @@ func (rf *Raft) electLeader() {
 
 	rf.Lock()
 	rf.currentTerm += 1
+	rf.votedFor = -1
+	rf.isLeader = false
+	rf.lasthb = time.Now()
+
 	req.Term = rf.currentTerm
 	req.CandidateId = rf.me
 	req.LastLogIndex = rf.lastLogIndex
 	req.LastLogTerm = rf.lastLogTerm()
 	req.RpcId = rf.GetRpcId()
-	rf.votedFor = -1
-	rf.isLeader = false
-	rf.lasthb = time.Now()
 	rf.Unlock()
 
 	DPrintf("X%d: electLeader ...", rf.me)
