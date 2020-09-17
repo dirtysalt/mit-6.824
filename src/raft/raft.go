@@ -81,7 +81,7 @@ type Raft struct {
 	commitCond *sync.Cond
 	replCond   []*sync.Cond
 	markhb     []bool      // 标记是否有hearbeat需要发送
-	followerhb []time.Time // 每个followe最新同步的时间
+	followerhb []time.Time // 每个follower最新同步的时间
 	applyCh    chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
@@ -588,7 +588,7 @@ func (rf *Raft) checkHeartbeat() {
 				for i := 0; i < len(rf.peers); i++ {
 					sb.WriteString(fmt.Sprintf("X%d:%d ms ", i, off.Milliseconds()))
 				}
-				DPrintf("X%d: leader lose connection to followers. hb: %s", rf.me, sb.String())
+				DPrintf("X%d: leader lose connection to majority. hb: %s", rf.me, sb.String())
 				do = true
 			}
 		}
