@@ -300,14 +300,15 @@ func (req *AppendEntriesRequest) String() string {
 }
 
 type AppendEntriesReply struct {
-	Term     int
-	Success  bool
-	Conflict bool
+	Term       int
+	Success    bool
+	Conflict   bool
+	RetryIndex int
 }
 
 func (x *AppendEntriesReply) String() string {
-	return fmt.Sprintf("reply(term=%d, ok=%v, conflict=%v)",
-		x.Term, x.Success, x.Conflict)
+	return fmt.Sprintf("reply(term=%d, ok=%v, conflict=%v, ri=%d)",
+		x.Term, x.Success, x.Conflict, x.RetryIndex)
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
@@ -339,11 +340,27 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 
 	idx := req.PrevLogIndex - rf.baseLogIndex
 	if idx >= len(rf.logs) || rf.logs[idx].Term != req.PrevLogTerm {
-		if idx < len(rf.logs) {
-			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v", rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
-		} else {
+		if idx >= len(rf.logs) {
 			DPrintf("X%d: mismatch log entry. too short", rf.me)
+			idx = len(rf.logs) - 1
 		}
+		if rf.logs[idx].Term != req.PrevLogTerm {
+			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
+				rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
+			searchTerm := req.PrevLogTerm
+			if rf.logs[idx].Term < req.PrevLogTerm {
+				// panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
+				searchTerm = rf.logs[idx].Term - 1
+			}
+			for idx >= 0 && rf.logs[idx].Term > searchTerm {
+				idx -= 1
+			}
+			if idx < 0 {
+				// 需要重新同步全量，因为没有可以使用的同步点
+				panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
+			}
+		}
+		reply.RetryIndex = idx + rf.baseLogIndex
 		reply.Conflict = true
 		return
 	}
@@ -681,7 +698,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 			reply := AppendEntriesReply{}
 			rf.Unlock()
 
-			DPrintf("X%d: sendAppendEntries to X%d: %v -> %v", rf.me, peer, &req, &reply)
+			DPrintf("X%d: sendAppendEntries to X%d: %v", rf.me, peer, &req)
 			// 本次发送失败，可能是follower不可达
 			if !rf.sendAppendEntries(peer, &req, &reply) {
 				continue
@@ -790,6 +807,7 @@ func (rf *Raft) electLeader() {
 	for i := 0; i < len(rf.peers); i++ {
 		go func(peer int) {
 			reply := RequestVoteReply{}
+			DPrintf("X%d: sendRequestVote to X%d: %v", rf.me, peer, &req)
 			if rf.sendRequestVote(peer, &req, &reply) {
 				valid := true
 				rf.Lock()
