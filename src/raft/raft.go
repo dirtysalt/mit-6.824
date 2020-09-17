@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +62,7 @@ type LogEntry struct {
 
 const (
 	sendHeartbeatInterval  = 200
+	loseConnectionTimeout  = sendHeartbeatInterval * 8
 	checkHeartbeatInterval = 50
 	electionTimeout        = 300
 	electionRandom         = 100
@@ -78,7 +80,8 @@ type Raft struct {
 	applyCond  *sync.Cond
 	commitCond *sync.Cond
 	replCond   []*sync.Cond
-	markhb     []bool
+	markhb     []bool      // 标记是否有hearbeat需要发送
+	followerhb []time.Time // 每个followe最新同步的时间
 	applyCh    chan ApplyMsg
 
 	rpcId int32
@@ -87,8 +90,8 @@ type Raft struct {
 	// state a Raft server must maintain.
 	isLeader     bool
 	leaderId     int
-	lasthb       time.Time
-	lasthbLeader time.Time
+	lasthb       time.Time // election timer
+	lasthbLeader time.Time // 用于快速否定request vote
 	logs         []LogEntry
 	currentTerm  int // last term server has ever seen
 	votedFor     int // candidate voted in current term
@@ -233,7 +236,8 @@ func (rf *Raft) getLogEntry(index int) *LogEntry {
 	return log
 }
 
-func (rf *Raft) toFollower(term int) {
+func (rf *Raft) changeToFollower(term int) {
+	DPrintf("X%d: change to follower. new term = %d", rf.me, term)
 	rf.isLeader = false
 	rf.votedFor = -1
 	rf.currentTerm = term
@@ -248,6 +252,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.Lock()
 	defer rf.Unlock()
 
+	DPrintf("X%d: RequestVote: %v >>>>>", rf.me, args)
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
@@ -262,7 +267,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.toFollower(args.Term)
+		rf.changeToFollower(args.Term)
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastTerm := rf.lastLogTerm()
@@ -277,7 +282,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		message += fmt.Sprintf("voted for %d", args.CandidateId)
 	}
 	rf.persist()
-	DPrintf("X%d: RequestVote: %v -> %v %s", rf.me, args, reply, message)
+	DPrintf("X%d: RequestVote: %v <<<<< %v %s ", rf.me, args, reply, message)
 }
 
 type AppendEntriesRequest struct {
@@ -296,12 +301,6 @@ type AppendEntriesReply struct {
 	Conflict bool
 }
 
-func (rf *Raft) updateHeartbeat() {
-	now := time.Now()
-	rf.lasthb = now
-	rf.lasthbLeader = now
-}
-
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
@@ -313,9 +312,12 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		return
 	}
 
-	rf.updateHeartbeat()
+	now := time.Now()
+	rf.lasthb = now
+	rf.lasthbLeader = now
+
 	if req.Term > rf.currentTerm {
-		rf.toFollower(req.Term)
+		rf.changeToFollower(req.Term)
 	}
 	rf.leaderId = req.LeaderId
 
@@ -492,8 +494,31 @@ func sleepMills(v int) {
 	time.Sleep(time.Duration(v) * time.Millisecond)
 }
 
+// type TimeList []time.Time
+
+// func (x TimeList) Len() int {
+// 	return len(x)
+// }
+// func (x TimeList) Less(i, j int) bool {
+// 	return x[i].UnixNano() < x[j].UnixNano()
+// }
+// func (x TimeList) Swap(i, j int) {
+// 	x[i], x[j] = x[j], x[i]
+// }
+
+// func (rf *Raft) maxFollwerHearbeat() time.Time {
+// 	match := make(TimeList, len(rf.peers))
+// 	for i := 0; i < len(rf.peers); i++ {
+// 		match[i] = rf.followerhb[i]
+// 	}
+// 	sort.Sort(match)
+// 	return match[len(rf.peers)/2]
+// }
+
 func (rf *Raft) sendHeartbeat() {
-	rf.updateHeartbeat()
+	now := time.Now()
+	rf.lasthb = now
+	rf.followerhb[rf.me] = now
 	for i := 0; i < len(rf.peers); i++ {
 		rf.markhb[i] = true
 	}
@@ -527,10 +552,29 @@ func (rf *Raft) checkHeartbeat() {
 		now := time.Now()
 		rf.Lock()
 		off := now.Sub(rf.lasthb)
-		rf.Unlock()
 		if off.Milliseconds() > (int64(electionTimeout) + (rand.Int63() % electionRandom)) {
 			do = true
 		}
+		if !do && rf.isLeader {
+			// 如果是leader的话，需要判断多少个followe已经超时
+			sb := strings.Builder{}
+
+			cnt := 0
+			for i := 0; i < len(rf.peers); i++ {
+				off = now.Sub(rf.followerhb[i])
+				if off.Milliseconds() > loseConnectionTimeout {
+					cnt += 1
+				}
+				sb.WriteString(fmt.Sprintf("X%d:%d ms ", i, off.Milliseconds()))
+			}
+			// DPrintf("X%d: leader follower hb: %s", rf.me, sb.String())
+			if cnt > len(rf.peers)/2 {
+				DPrintf("X%d: leader lose connection to followers", rf.me)
+				do = true
+			}
+		}
+		rf.Unlock()
+
 		if !do {
 			sleepMills(checkHeartbeatInterval)
 			continue
@@ -595,6 +639,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 		rf.Lock()
 		if !rf.okToRepl(peer) {
 			rf.replCond[peer].Wait()
+			rf.Unlock()
 		} else {
 			rf.markhb[peer] = false
 			prevIndex := rf.nextIndex[peer] - 1
@@ -618,16 +663,17 @@ func (rf *Raft) checkReplProgress(peer int) {
 			reply := AppendEntriesReply{}
 			rf.Unlock()
 
-			for {
-				if rf.sendAppendEntries(peer, &req, &reply) {
-					break
-				}
+			// 本次发送失败，可能是follower不可达
+			if !rf.sendAppendEntries(peer, &req, &reply) {
+				break
 			}
 
+			now := time.Now()
+			rf.followerhb[peer] = now
 			rf.Lock()
 			if !reply.Success {
 				if reply.Term > rf.currentTerm {
-					rf.toFollower(reply.Term)
+					rf.changeToFollower(reply.Term)
 				}
 				if reply.Conflict {
 					// term confliction
@@ -646,8 +692,8 @@ func (rf *Raft) checkReplProgress(peer int) {
 			if ok && lastIndex < rf.lastLogIndex {
 				rf.replCond[peer].Signal()
 			}
+			rf.Unlock()
 		}
-		rf.Unlock()
 	}
 }
 
@@ -686,7 +732,7 @@ func (rf *Raft) maxReplicateIndex() int {
 	for i := 0; i < len(rf.peers); i++ {
 		match[i] = rf.matchIndex[i]
 	}
-	sort.Sort(sort.IntSlice(match))
+	sort.Ints(match)
 	// DPrintf("X%d: match index = %v(%v)", rf.me, match, rf.matchIndex)
 	return match[len(rf.peers)/2]
 }
@@ -713,9 +759,8 @@ func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
 	rf.Lock()
-	rf.currentTerm += 1
-	rf.votedFor = -1
-	rf.isLeader = false
+	rf.changeToFollower(rf.currentTerm + 1)
+	// reset election timer
 	rf.lasthb = time.Now()
 
 	req.Term = rf.currentTerm
@@ -737,7 +782,7 @@ func (rf *Raft) electLeader() {
 				// 因为这里投票其实是投给req.Term
 				// 如果这里直接更新了currentTerm的话，那么就会出现两个leader.
 				if reply.Term > rf.currentTerm {
-					rf.toFollower(reply.Term)
+					rf.changeToFollower(reply.Term)
 				}
 				if req.Term != rf.currentTerm {
 					valid = false
@@ -779,8 +824,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitCond = sync.NewCond(&rf.mu)
 	rf.replCond = make([]*sync.Cond, len(rf.peers))
 	rf.markhb = make([]bool, len(rf.peers))
+	rf.followerhb = make([]time.Time, len(rf.peers))
+	now := time.Now()
 	for i := 0; i < len(rf.peers); i++ {
 		rf.replCond[i] = sync.NewCond(&rf.mu)
+		rf.followerhb[i] = now
 	}
 
 	// Your initialization code here (2A, 2B, 2C).

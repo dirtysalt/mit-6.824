@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Copyright (C) dirlt
 
-rm -rf output
-mkdir -p output
+T=$1
+OUT="output$T"
+
+rm -rf $OUT
+mkdir -p $OUT
+
 for ((i=0;i<50;i++))
 do
-    go test -run 2B | tee output/run$i.txt
+    go test -run $T | tee $OUT/run$i.txt
 done
-grep "^FAIL" output/*
+
+grep "^FAIL" $OUT/*
