@@ -62,7 +62,7 @@ type LogEntry struct {
 
 const (
 	sendHeartbeatInterval  = 200
-	loseConnectionTimeout  = sendHeartbeatInterval * 5
+	loseConnectionTimeout  = sendHeartbeatInterval * 8
 	checkHeartbeatInterval = 50
 	electionTimeout        = 300
 	electionRandom         = 100
@@ -669,9 +669,9 @@ func (rf *Raft) checkReplProgress(peer int) {
 				break
 			}
 
+			rf.Lock()
 			now := time.Now()
 			rf.followerhb[peer] = now
-			rf.Lock()
 			if !reply.Success {
 				if reply.Term > rf.currentTerm {
 					rf.changeToFollower(reply.Term, "checkReplProgress")
