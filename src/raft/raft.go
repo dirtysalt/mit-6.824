@@ -347,17 +347,20 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		if rf.logs[idx].Term != req.PrevLogTerm {
 			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
 				rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
-			searchTerm := req.PrevLogTerm
 			if rf.logs[idx].Term < req.PrevLogTerm {
 				// panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
-				searchTerm = rf.logs[idx].Term - 1
-			}
-			for idx >= 0 && rf.logs[idx].Term > searchTerm {
+				// 好像中不到更好的办法
 				idx -= 1
-			}
-			if idx < 0 {
-				// 需要重新同步全量，因为没有可以使用的同步点
-				panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
+			} else {
+				// 找到最新一个<=PrevLogTerm的日志点
+				for idx >= 0 && rf.logs[idx].Term > req.PrevLogTerm {
+					idx -= 1
+				}
+				if idx < 0 {
+					// 需要重新同步全量，因为没有可以使用的同步点
+					// 但是因为没有log compaction，所以不会出现这种情况
+					panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
+				}
 			}
 		}
 		reply.RetryIndex = idx + rf.baseLogIndex
