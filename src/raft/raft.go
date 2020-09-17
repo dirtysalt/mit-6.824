@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -236,8 +235,8 @@ func (rf *Raft) getLogEntry(index int) *LogEntry {
 	return log
 }
 
-func (rf *Raft) changeToFollower(term int) {
-	DPrintf("X%d: change to follower. new term = %d", rf.me, term)
+func (rf *Raft) changeToFollower(term int, reason string) {
+	DPrintf("X%d: change to follower. new term = %d, reason = %s", rf.me, term, reason)
 	rf.isLeader = false
 	rf.votedFor = -1
 	rf.currentTerm = term
@@ -267,7 +266,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.changeToFollower(args.Term)
+		rf.changeToFollower(args.Term, "RequestVote")
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastTerm := rf.lastLogTerm()
@@ -304,6 +303,18 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
 	rf.Lock()
 	defer rf.Unlock()
+
+	// 给自己发送heartbeat, 只更新心跳时间不做其他处理
+	// 正常情况下面肯定是不需要的，但是实验模拟上会模拟断网
+	// 那么自己到自己是不通的，并且希望自己drop leader
+	// 否则断网情况下面自己会长时间保留leader地位
+	if req.LeaderId == rf.me {
+		DPrintf("X%d: leader update hb", rf.me)
+		now := time.Now()
+		rf.lasthb = now
+		return
+	}
+
 	reply.Success = false
 	reply.Term = rf.currentTerm
 	reply.Conflict = false
@@ -317,7 +328,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	rf.lasthbLeader = now
 
 	if req.Term > rf.currentTerm {
-		rf.changeToFollower(req.Term)
+		rf.changeToFollower(req.Term, "AppendEntries")
 	}
 	rf.leaderId = req.LeaderId
 
@@ -516,9 +527,6 @@ func sleepMills(v int) {
 // }
 
 func (rf *Raft) sendHeartbeat() {
-	now := time.Now()
-	rf.lasthb = now
-	rf.followerhb[rf.me] = now
 	for i := 0; i < len(rf.peers); i++ {
 		rf.markhb[i] = true
 	}
@@ -555,24 +563,24 @@ func (rf *Raft) checkHeartbeat() {
 		if off.Milliseconds() > (int64(electionTimeout) + (rand.Int63() % electionRandom)) {
 			do = true
 		}
-		if !do && rf.isLeader {
-			// 如果是leader的话，需要判断多少个followe已经超时
-			sb := strings.Builder{}
+		// if !do && rf.isLeader {
+		// 	// 如果是leader的话，需要判断多少个followe已经超时
+		// 	sb := strings.Builder{}
 
-			cnt := 0
-			for i := 0; i < len(rf.peers); i++ {
-				off = now.Sub(rf.followerhb[i])
-				if off.Milliseconds() > loseConnectionTimeout {
-					cnt += 1
-				}
-				sb.WriteString(fmt.Sprintf("X%d:%d ms ", i, off.Milliseconds()))
-			}
-			// DPrintf("X%d: leader follower hb: %s", rf.me, sb.String())
-			if cnt > len(rf.peers)/2 {
-				DPrintf("X%d: leader lose connection to followers", rf.me)
-				do = true
-			}
-		}
+		// 	cnt := 0
+		// 	for i := 0; i < len(rf.peers); i++ {
+		// 		off = now.Sub(rf.followerhb[i])
+		// 		if off.Milliseconds() > loseConnectionTimeout {
+		// 			cnt += 1
+		// 		}
+		// 		sb.WriteString(fmt.Sprintf("X%d:%d ms ", i, off.Milliseconds()))
+		// 	}
+		// 	// DPrintf("X%d: leader follower hb: %s", rf.me, sb.String())
+		// 	if cnt > len(rf.peers)/2 {
+		// 		DPrintf("X%d: leader lose connection to followers", rf.me)
+		// 		do = true
+		// 	}
+		// }
 		rf.Unlock()
 
 		if !do {
@@ -617,7 +625,7 @@ func (rf *Raft) changeToLeader() {
 }
 
 func (rf *Raft) okToRepl(peer int) bool {
-	if !rf.isLeader || rf.me == peer {
+	if !rf.isLeader {
 		return false
 	}
 	if rf.markhb[peer] {
@@ -670,10 +678,16 @@ func (rf *Raft) checkReplProgress(peer int) {
 
 			now := time.Now()
 			rf.followerhb[peer] = now
+
+			// 给自己发送heartbeat
+			if rf.me == peer {
+				break
+			}
+
 			rf.Lock()
 			if !reply.Success {
 				if reply.Term > rf.currentTerm {
-					rf.changeToFollower(reply.Term)
+					rf.changeToFollower(reply.Term, "checkReplProgress")
 				}
 				if reply.Conflict {
 					// term confliction
@@ -759,7 +773,7 @@ func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
 	rf.Lock()
-	rf.changeToFollower(rf.currentTerm + 1)
+	rf.changeToFollower(rf.currentTerm+1, "electLeader")
 	// reset election timer
 	rf.lasthb = time.Now()
 
@@ -782,7 +796,7 @@ func (rf *Raft) electLeader() {
 				// 因为这里投票其实是投给req.Term
 				// 如果这里直接更新了currentTerm的话，那么就会出现两个leader.
 				if reply.Term > rf.currentTerm {
-					rf.changeToFollower(reply.Term)
+					rf.changeToFollower(reply.Term, "electLeaderResponse")
 				}
 				if req.Term != rf.currentTerm {
 					valid = false
