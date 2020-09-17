@@ -78,6 +78,7 @@ type Raft struct {
 	applyCond  *sync.Cond
 	commitCond *sync.Cond
 	replCond   []*sync.Cond
+	markhb     []bool
 	applyCh    chan ApplyMsg
 
 	rpcId int32
@@ -142,15 +143,17 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 
 	// disable persist first.
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.votedFor)
-	// e.Encode(rf.currentTerm)
-	// e.Encode(rf.logs)
-	// e.Encode(rf.lastLogIndex)
-	// e.Encode(rf.baseLogIndex)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	if true {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(rf.votedFor)
+		e.Encode(rf.currentTerm)
+		e.Encode(rf.logs)
+		e.Encode(rf.lastLogIndex)
+		e.Encode(rf.baseLogIndex)
+		data := w.Bytes()
+		rf.persister.SaveRaftState(data)
+	}
 }
 
 //
@@ -490,42 +493,11 @@ func sleepMills(v int) {
 }
 
 func (rf *Raft) sendHeartbeat() {
-	prevIndex := rf.lastLogIndex
-	prevLog := rf.getLogEntry(prevIndex)
-
-	req := AppendEntriesRequest{
-		Heartbeat:         true,
-		Term:              rf.currentTerm,
-		LeaderId:          rf.me,
-		PrevLogIndex:      prevIndex,
-		PrevLogTerm:       prevLog.Term,
-		LeaderCommitIndex: rf.commitIndex,
-		Entries:           []LogEntry{},
-	}
+	rf.updateHeartbeat()
 	for i := 0; i < len(rf.peers); i++ {
-		// 不要发送给自己，logs覆盖上会出现问题
-		if i == rf.me {
-			rf.updateHeartbeat()
-			continue
-		}
-
-		go func(peer int) {
-			reply := AppendEntriesReply{}
-			if rf.sendAppendEntries(peer, &req, &reply) {
-				if !reply.Success {
-					rf.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.toFollower(reply.Term)
-					}
-					if reply.Conflict {
-						// term confliction
-						rf.nextIndex[peer] = prevIndex
-					}
-					rf.Unlock()
-				}
-			}
-		}(i)
+		rf.markhb[i] = true
 	}
+	rf.signalRepl()
 }
 
 func (rf *Raft) keepHeartbeat() {
@@ -600,6 +572,19 @@ func (rf *Raft) changeToLeader() {
 	rf.sendHeartbeat()
 }
 
+func (rf *Raft) okToRepl(peer int) bool {
+	if !rf.isLeader || rf.me == peer {
+		return false
+	}
+	if rf.markhb[peer] {
+		return true
+	}
+	if rf.nextIndex[peer] > rf.lastLogIndex {
+		return false
+	}
+	return true
+}
+
 func (rf *Raft) checkReplProgress(peer int) {
 	ok := false
 
@@ -608,9 +593,10 @@ func (rf *Raft) checkReplProgress(peer int) {
 			break
 		}
 		rf.Lock()
-		if !rf.isLeader || rf.me == peer || rf.nextIndex[peer] > rf.lastLogIndex {
+		if !rf.okToRepl(peer) {
 			rf.replCond[peer].Wait()
 		} else {
+			rf.markhb[peer] = false
 			prevIndex := rf.nextIndex[peer] - 1
 			lastIndex := rf.lastLogIndex
 			prevLog := rf.getLogEntry(prevIndex)
@@ -792,6 +778,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.commitCond = sync.NewCond(&rf.mu)
 	rf.replCond = make([]*sync.Cond, len(rf.peers))
+	rf.markhb = make([]bool, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		rf.replCond[i] = sync.NewCond(&rf.mu)
 	}
