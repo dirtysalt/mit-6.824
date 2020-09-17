@@ -84,7 +84,6 @@ type Raft struct {
 	followerhb []time.Time // 每个followe最新同步的时间
 	applyCh    chan ApplyMsg
 
-	rpcId int32
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -103,9 +102,6 @@ type Raft struct {
 	matchIndex   []int
 }
 
-func (rf *Raft) GetRpcId() int32 {
-	return atomic.AddInt32(&(rf.rpcId), 1)
-}
 func (rf *Raft) Lock() {
 	rf.mu.Lock()
 }
@@ -203,8 +199,8 @@ type RequestVoteArgs struct {
 }
 
 func (args *RequestVoteArgs) String() string {
-	return fmt.Sprintf("req(rpcId=%d, term=%d, candId=%d, logIndex=%d, logTerm=%d)",
-		args.RpcId, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+	return fmt.Sprintf("req(term=%d, candId=%d, logIndex=%d, logTerm=%d)",
+		args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 }
 
 //
@@ -251,6 +247,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.Lock()
 	defer rf.Unlock()
+	trace := strings.Builder{}
+	defer func() {
+		DPrintf("X%d: RequestVote: %v --> %v %s ", rf.me, args, reply, trace.String())
+	}()
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -259,13 +259,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	off := now.Sub(rf.lasthbLeader)
 	// disregard vote if you think a leader exists.
 	if off.Milliseconds() < sendHeartbeatInterval {
+		trace.WriteString("[ignore for heartheat]")
 		return
 	}
 
 	if args.Term < rf.currentTerm {
+		trace.WriteString("[ignore lower term]")
 		return
 	}
 	if args.Term > rf.currentTerm {
+		trace.WriteString("[update higher term]")
 		rf.changeToFollower(args.Term, "RequestVote")
 	}
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -276,16 +279,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 	}
 
-	message := ""
 	if reply.VoteGranted {
-		message += fmt.Sprintf("voted for %d", args.CandidateId)
+		trace.WriteString(fmt.Sprintf("[voted for %d]", args.CandidateId))
 	}
 	rf.persist()
-	DPrintf("X%d: RequestVote: %v ---> %v %s ", rf.me, args, reply, message)
 }
 
 type AppendEntriesRequest struct {
-	Heartbeat         bool
 	Term              int
 	LeaderId          int
 	PrevLogIndex      int
@@ -294,10 +294,20 @@ type AppendEntriesRequest struct {
 	LeaderCommitIndex int
 }
 
+func (req *AppendEntriesRequest) String() string {
+	return fmt.Sprintf("req(term=%d, leaderId=%d, prevIndex=%d, prevTerm=%d, leaderCommitIndex=%d)",
+		req.Term, req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, req.LeaderCommitIndex)
+}
+
 type AppendEntriesReply struct {
 	Term     int
 	Success  bool
 	Conflict bool
+}
+
+func (x *AppendEntriesReply) String() string {
+	return fmt.Sprintf("reply(term=%d, ok=%v, conflict=%v)",
+		x.Term, x.Success, x.Conflict)
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
@@ -306,8 +316,14 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	reply.Success = false
 	reply.Term = rf.currentTerm
 	reply.Conflict = false
+	trace := strings.Builder{}
+
+	defer func() {
+		DPrintf("X%d: AppendEntries:%v -> %v %s", rf.me, req, reply, trace.String())
+	}()
 
 	if req.Term < rf.currentTerm {
+		trace.WriteString("[ignore lower term]")
 		return
 	}
 
@@ -316,6 +332,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	rf.lasthbLeader = now
 
 	if req.Term > rf.currentTerm {
+		trace.WriteString("[update higher term]")
 		rf.changeToFollower(req.Term, "AppendEntries")
 	}
 	rf.leaderId = req.LeaderId
@@ -349,6 +366,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 
 	// 这里更新commitIndex前提是logs已经完全一致了
 	if req.LeaderCommitIndex > rf.commitIndex {
+		trace.WriteString("[update commit index]")
 		DPrintf("X%d: update commit index %d->%d(%d)", rf.me, rf.commitIndex, req.LeaderCommitIndex, rf.lastLogIndex)
 		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastLogIndex)
 		rf.applyCond.Signal()
@@ -608,7 +626,7 @@ func (rf *Raft) changeToLeader() {
 	defer rf.Unlock()
 
 	rf.isLeader = true
-	DPrintf("X%d: I am leader now, term = %d", rf.me, rf.currentTerm)
+	DPrintf("X%d: change to leader. new term = %d", rf.me, rf.currentTerm)
 
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.lastLogIndex + 1
@@ -652,7 +670,6 @@ func (rf *Raft) checkReplProgress(peer int) {
 			}
 
 			req := AppendEntriesRequest{
-				Heartbeat:         false,
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
 				PrevLogIndex:      prevIndex,
@@ -664,9 +681,10 @@ func (rf *Raft) checkReplProgress(peer int) {
 			reply := AppendEntriesReply{}
 			rf.Unlock()
 
+			DPrintf("X%d: sendAppendEntries to X%d: %v -> %v", rf.me, peer, &req, &reply)
 			// 本次发送失败，可能是follower不可达
 			if !rf.sendAppendEntries(peer, &req, &reply) {
-				break
+				continue
 			}
 
 			rf.Lock()
@@ -690,9 +708,6 @@ func (rf *Raft) checkReplProgress(peer int) {
 				ok = true
 			}
 
-			if ok && lastIndex < rf.lastLogIndex {
-				rf.replCond[peer].Signal()
-			}
 			rf.Unlock()
 		}
 	}
@@ -768,7 +783,6 @@ func (rf *Raft) electLeader() {
 	req.CandidateId = rf.me
 	req.LastLogIndex = rf.lastLogIndex
 	req.LastLogTerm = rf.lastLogTerm()
-	req.RpcId = rf.GetRpcId()
 	rf.Unlock()
 
 	DPrintf("X%d: electLeader ...", rf.me)
@@ -819,7 +833,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.rpcId = int32(me+1) * 1000
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.applyCh = applyCh
 	rf.commitCond = sync.NewCond(&rf.mu)

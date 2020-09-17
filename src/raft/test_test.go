@@ -371,6 +371,7 @@ func TestRejoin2B(t *testing.T) {
 	cfg.one(104, 2, true)
 
 	// all together now
+	DPrintf("connect leader X%d", leader2)
 	cfg.connect(leader2)
 
 	cfg.one(105, servers, true)
