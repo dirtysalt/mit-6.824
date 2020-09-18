@@ -645,10 +645,11 @@ func (rf *Raft) changeToLeader() {
 
 	rf.isLeader = true
 	DPrintf("X%d: change to leader. new term = %d", rf.me, rf.currentTerm)
-
+	now := time.Now()
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.lastLogIndex + 1
 		rf.matchIndex[i] = 0
+		rf.followerhb[i] = now
 	}
 	rf.sendHeartbeat()
 }
