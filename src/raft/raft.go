@@ -300,15 +300,15 @@ func (req *AppendEntriesRequest) String() string {
 }
 
 type AppendEntriesReply struct {
-	Term       int
-	Success    bool
-	Conflict   bool
-	RetryIndex int
+	Term      int
+	Success   bool
+	Conflict  bool
+	SyncIndex int
 }
 
 func (x *AppendEntriesReply) String() string {
-	return fmt.Sprintf("reply(term=%d, ok=%v, conflict=%v, ri=%d)",
-		x.Term, x.Success, x.Conflict, x.RetryIndex)
+	return fmt.Sprintf("reply(term=%d, ok=%v, conflict=%v, si=%d)",
+		x.Term, x.Success, x.Conflict, x.SyncIndex)
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
@@ -343,27 +343,28 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		if idx >= len(rf.logs) {
 			DPrintf("X%d: mismatch log entry. too short", rf.me)
 			idx = len(rf.logs) - 1
-		}
-		if rf.logs[idx].Term != req.PrevLogTerm {
+		} else {
 			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
 				rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
 			if rf.logs[idx].Term < req.PrevLogTerm {
 				// panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
-				// 好像中不到更好的办法
 				idx -= 1
 			} else {
 				// 找到最新一个<=PrevLogTerm的日志点
+				rb := 0
 				for idx >= 0 && rf.logs[idx].Term > req.PrevLogTerm {
 					idx -= 1
+					rb += 1
 				}
 				if idx < 0 {
 					// 需要重新同步全量，因为没有可以使用的同步点
 					// 但是因为没有log compaction，所以不会出现这种情况
 					panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
 				}
+				DPrintf("X%d: rollback %d entries", rf.me, rb)
 			}
 		}
-		reply.RetryIndex = idx + rf.baseLogIndex
+		reply.SyncIndex = idx + rf.baseLogIndex
 		reply.Conflict = true
 		return
 	}
@@ -716,7 +717,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 				}
 				if reply.Conflict {
 					// term confliction
-					rf.nextIndex[peer] = prevIndex
+					rf.nextIndex[peer] = reply.SyncIndex + 1
 				}
 				ok = false
 			} else {
