@@ -66,6 +66,7 @@ const (
 	checkHeartbeatInterval = 50
 	electionTimeout        = 300
 	electionRandom         = 100
+	maxNumberLogEntries    = 100
 )
 
 //
@@ -346,23 +347,19 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		} else {
 			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
 				rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
-			if rf.logs[idx].Term < req.PrevLogTerm {
-				// panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
-				idx -= 1
-			} else {
-				// 找到最新一个<=PrevLogTerm的日志点
-				rb := 0
-				for idx >= 0 && rf.logs[idx].Term > req.PrevLogTerm {
-					idx -= 1
-					rb += 1
-				}
-				if idx < 0 {
-					// 需要重新同步全量，因为没有可以使用的同步点
-					// 但是因为没有log compaction，所以不会出现这种情况
-					panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
-				}
-				DPrintf("X%d: rollback %d entries", rf.me, rb)
+			if rf.logs[idx].Term > req.PrevLogTerm {
+				panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
 			}
+			searchTerm := rf.logs[idx].Term - 1
+			rb := 0
+			for idx >= 0 && rf.logs[idx].Term > searchTerm && (idx+rf.baseLogIndex) > rf.commitIndex {
+				idx -= 1
+				rb += 1
+			}
+			if idx < 0 {
+				panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
+			}
+			DPrintf("X%d: rollback %d entries", rf.me, rb)
 		}
 		reply.SyncIndex = idx + rf.baseLogIndex
 		reply.Conflict = true
@@ -688,6 +685,11 @@ func (rf *Raft) checkReplProgress(peer int) {
 			// 如果之前失败的话，那么首先发送一个空log去同步
 			if !ok {
 				lastIndex = prevIndex
+			}
+
+			// 控制单次最多发送的数量
+			if lastIndex-prevIndex > maxNumberLogEntries {
+				lastIndex = prevIndex + maxNumberLogEntries
 			}
 
 			req := AppendEntriesRequest{
