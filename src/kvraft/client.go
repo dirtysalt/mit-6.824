@@ -1,13 +1,31 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
+	"sync/atomic"
 
+	"../labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	clientId  int
+	requestId int32
+	mu        sync.Mutex
+}
+
+func (ck *Clerk) Lock() {
+	ck.mu.Lock()
+}
+func (ck *Clerk) Unlock() {
+	ck.mu.Unlock()
+}
+
+func (ck *Clerk) newRequestId() int32 {
+	return atomic.AddInt32(&ck.requestId, 1) - 1
 }
 
 func nrand() int64 {
@@ -21,6 +39,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = int(nrand())
+	ck.requestId = 0
 	return ck
 }
 
@@ -37,9 +57,34 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	idx := int(nrand()) % len(ck.servers)
+	reqId := ck.newRequestId()
+	req := GetArgs{
+		Key:       key,
+		RequestId: reqId,
+		ClientId:  ck.clientId,
+	}
+	reply := GetReply{}
+
+	ans := ""
+	for {
+		ok := ck.servers[idx].Call("KVServer.Get", &req, &reply)
+		if !ok {
+			DPrintf("CK%d: Get failed", ck.clientId)
+		} else {
+			if reply.Err == ErrWrongLeader {
+				idx = reply.LeaderIdx
+				DPrintf("CK%d: Get wrong leader, try new leader: X%d", ck.clientId, idx)
+			} else {
+				if reply.Err == OK {
+					ans = reply.Value
+				}
+				break
+			}
+		}
+	}
+	return ans
 }
 
 //
@@ -54,6 +99,29 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	idx := int(nrand()) % len(ck.servers)
+	reqId := ck.newRequestId()
+	req := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		RequestId: reqId,
+		ClientId:  ck.clientId,
+	}
+	reply := PutAppendReply{}
+	for {
+		ok := ck.servers[idx].Call("KVServer.PutAppend", &req, &reply)
+		if !ok {
+			DPrintf("CK%d: PutAppend failed", ck.clientId)
+		} else {
+			if reply.Err == ErrWrongLeader {
+				idx = reply.LeaderIdx
+				DPrintf("CK%d: PutAppend wrong leader. try new leader: X%d", ck.clientId, idx)
+			} else {
+				break
+			}
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
