@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -9,12 +10,24 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	OpGet          = "Get"
+	OpPut          = "Put"
+	OpAppend       = "Append"
 )
 
 type Err string
 
 func SleepMills(v int) {
 	time.Sleep(time.Duration(v) * time.Millisecond)
+}
+
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
 }
 
 // Put or Append

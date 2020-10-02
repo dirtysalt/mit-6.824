@@ -49,10 +49,20 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
+	// extra fields
+	OpName string
+	RpcId  int32
 }
 
 func (msg *ApplyMsg) String() string {
-	return fmt.Sprintf("ApplyMsg(valid=%v, command=%v, index=%d)", msg.CommandValid, msg.Command, msg.CommandIndex)
+	if msg.CommandValid {
+		return fmt.Sprintf("ApplyMsg(command=%v, term=%d, index=%d)",
+			msg.Command, msg.CommandTerm, msg.CommandIndex)
+	} else {
+		return fmt.Sprintf("ApplyMsg(opname=%s, rpcid=%d, command=%v)",
+			msg.OpName, msg.RpcId, msg.Command)
+	}
 }
 
 type LogEntry struct {
@@ -754,6 +764,7 @@ func (rf *Raft) checkApplyProgress() {
 					CommandValid: true,
 					Command:      log.Command,
 					CommandIndex: i,
+					CommandTerm:  log.Term,
 				}
 				DPrintf("X%d: commit msg = %v", rf.me, &msg)
 				if rf.isLeader {

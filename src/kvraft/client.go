@@ -21,6 +21,10 @@ type Clerk struct {
 var GlobalClientId int32 = 0
 var GlobalRpcId int32 = 0
 
+const (
+	RetryWaitTime = 50
+)
+
 func (ck *Clerk) Lock() {
 	ck.mu.Lock()
 }
@@ -90,11 +94,10 @@ func (ck *Clerk) Get(key string) string {
 		DPrintf("ck%d: kv%d:%s(%v) %s -> %s", ck.clientId, idx, name, ok, &req, &reply)
 		if !ok || reply.Err == ErrWrongLeader {
 			idx = (idx + 1) % len(ck.servers)
+			SleepMills(RetryWaitTime)
 		}
-		if reply.Err == OK || reply.Err == ErrNoKey {
-			if reply.Err == OK {
-				ans = reply.Value
-			}
+		if reply.Err == OK {
+			ans = reply.Value
 			break
 		}
 	}
@@ -131,6 +134,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		DPrintf("ck%d: kv%d:%s(%v) %s -> %s", ck.clientId, idx, name, ok, &req, &reply)
 		if !ok || reply.Err == ErrWrongLeader {
 			idx = (idx + 1) % len(ck.servers)
+			SleepMills(RetryWaitTime)
 		}
 		if reply.Err == OK {
 			break
@@ -140,8 +144,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, OpPut)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, OpAppend)
 }
