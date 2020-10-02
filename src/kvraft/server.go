@@ -1,15 +1,17 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
+	"fmt"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +20,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Cmd       string
+	Key       string
+	Value     string
+	ClientId  int32
+	RequestId int32
+}
+
+func (op *Op) String() string {
+	return fmt.Sprintf("op(cmd=%s, key=%s, value=%s, clientId=%d, requestId=%d)",
+		op.Cmd, op.Key, op.Value, op.ClientId, op.RequestId)
 }
 
 type KVServer struct {
@@ -37,13 +48,45 @@ type KVServer struct {
 	// Your definitions here.
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	op := Op{
+		Cmd:       "Get",
+		Key:       args.Key,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	term, index, isLeader := kv.rf.Start(&op)
+	DPrintf("kv%d: start command %s -> reply(term=%d, index=%d, isLeader=%v)", kv.me, &op, term, index, isLeader)
+	reply.Err = OK
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// TODO:
+	term++
+	index++
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{
+		Cmd:       args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	term, index, isLeader := kv.rf.Start(&op)
+	DPrintf("kv%d: start command %s -> reply(term=%d, index=%d, isLeader=%v)", kv.me, &op, term, index, isLeader)
+	reply.Err = OK
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// TODO:
+	term++
+	index++
 }
 
 //
@@ -79,7 +122,7 @@ func (kv *KVServer) killed() bool {
 // in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
+// for any long-running work.oo
 //
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want

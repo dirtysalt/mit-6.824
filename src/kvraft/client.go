@@ -12,16 +12,30 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	clientId  int
+	clientId  int32
 	requestId int32
 	mu        sync.Mutex
+	leaderIdx int
 }
+
+var GlobalClientId int32 = 0
+var GlobalRpcId int32 = 0
 
 func (ck *Clerk) Lock() {
 	ck.mu.Lock()
 }
 func (ck *Clerk) Unlock() {
 	ck.mu.Unlock()
+}
+func (ck *Clerk) GetLeaderIdx() int {
+	ck.Lock()
+	defer ck.Unlock()
+	return ck.leaderIdx
+}
+func (ck *Clerk) SetLeaderIdx(v int) {
+	ck.Lock()
+	defer ck.Unlock()
+	ck.leaderIdx = v
 }
 
 func (ck *Clerk) newRequestId() int32 {
@@ -39,8 +53,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	ck.clientId = int(nrand())
+	ck.clientId = atomic.AddInt32(&GlobalClientId, 1) - 1
 	ck.requestId = 0
+	idx := int(nrand()) % len(ck.servers)
+	ck.SetLeaderIdx(idx)
 	return ck
 }
 
@@ -58,32 +74,31 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	idx := int(nrand()) % len(ck.servers)
 	reqId := ck.newRequestId()
 	req := GetArgs{
 		Key:       key,
 		RequestId: reqId,
 		ClientId:  ck.clientId,
 	}
-	reply := GetReply{}
-
+	idx := ck.GetLeaderIdx()
+	name := "KVServer.Get"
 	ans := ""
 	for {
-		ok := ck.servers[idx].Call("KVServer.Get", &req, &reply)
-		if !ok {
-			DPrintf("CK%d: Get failed", ck.clientId)
-		} else {
-			if reply.Err == ErrWrongLeader {
-				idx = reply.LeaderIdx
-				DPrintf("CK%d: Get wrong leader, try new leader: X%d", ck.clientId, idx)
-			} else {
-				if reply.Err == OK {
-					ans = reply.Value
-				}
-				break
+		reply := GetReply{}
+		req.RpcId = atomic.AddInt32(&GlobalRpcId, 1) - 1
+		ok := ck.servers[idx].Call(name, &req, &reply)
+		DPrintf("ck%d: kv%d:%s(%v) %s -> %s", ck.clientId, idx, name, ok, &req, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			idx = (idx + 1) % len(ck.servers)
+		}
+		if reply.Err == OK || reply.Err == ErrNoKey {
+			if reply.Err == OK {
+				ans = reply.Value
 			}
+			break
 		}
 	}
+	ck.SetLeaderIdx(idx)
 	return ans
 }
 
@@ -99,7 +114,6 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	idx := int(nrand()) % len(ck.servers)
 	reqId := ck.newRequestId()
 	req := PutAppendArgs{
 		Key:       key,
@@ -108,20 +122,21 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		RequestId: reqId,
 		ClientId:  ck.clientId,
 	}
-	reply := PutAppendReply{}
+	idx := ck.GetLeaderIdx()
+	name := "KVServer.PutAppend"
 	for {
-		ok := ck.servers[idx].Call("KVServer.PutAppend", &req, &reply)
-		if !ok {
-			DPrintf("CK%d: PutAppend failed", ck.clientId)
-		} else {
-			if reply.Err == ErrWrongLeader {
-				idx = reply.LeaderIdx
-				DPrintf("CK%d: PutAppend wrong leader. try new leader: X%d", ck.clientId, idx)
-			} else {
-				break
-			}
+		reply := PutAppendReply{}
+		req.RpcId = atomic.AddInt32(&GlobalRpcId, 1) - 1
+		ok := ck.servers[idx].Call(name, &req, &reply)
+		DPrintf("ck%d: kv%d:%s(%v) %s -> %s", ck.clientId, idx, name, ok, &req, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
+			idx = (idx + 1) % len(ck.servers)
+		}
+		if reply.Err == OK {
+			break
 		}
 	}
+	ck.SetLeaderIdx(idx)
 }
 
 func (ck *Clerk) Put(key string, value string) {
