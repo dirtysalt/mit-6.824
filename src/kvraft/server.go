@@ -22,14 +22,15 @@ type Op struct {
 	Cmd       string
 	Key       string
 	Value     string
+	ServerId  int
 	RpcId     int32
 	ClientId  int32
 	RequestId int32
 }
 
 func (op *Op) String() string {
-	return fmt.Sprintf("op(cmd=%s, key=%s, value='%s', rpcId=%d, clientId=%d, requestId=%d)",
-		op.Cmd, op.Key, op.Value, op.RpcId, op.ClientId, op.RequestId)
+	return fmt.Sprintf("op(cmd=%s, key=%s, value='%s', serverId=%d, rpcId=%d, clientId=%d, requestId=%d)",
+		op.Cmd, op.Key, op.Value, op.ServerId, op.RpcId, op.ClientId, op.RequestId)
 }
 
 type KVServer struct {
@@ -130,6 +131,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{
 		Cmd:       OpGet,
 		Key:       args.Key,
+		ServerId:  kv.me,
 		RpcId:     rpcId,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
@@ -149,6 +151,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Cmd:       args.Op,
 		Key:       args.Key,
 		Value:     args.Value,
+		ServerId:  kv.me,
 		RpcId:     rpcId,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
@@ -208,13 +211,14 @@ func (kv *KVServer) applyOp(op *Op) (ans string) {
 func (kv *KVServer) applyWorker() {
 	for {
 		msg := <-kv.applyCh
-		_, isLeader := kv.rf.GetState()
-		if isLeader {
-			DPrintf("kv%d: apply message %v", kv.me, &msg)
-		}
 		if msg.CommandValid {
 			// TODO: apply
 			op := msg.Command.(Op)
+			byMe := (op.ServerId == kv.me)
+			if byMe {
+				DPrintf("kv%d: apply message %v", kv.me, &msg)
+			}
+
 			value := kv.applyOp(&op)
 			kv.applyIndex = msg.CommandIndex
 
@@ -230,11 +234,12 @@ func (kv *KVServer) applyWorker() {
 			if ok {
 				ch <- res
 			} else {
-				if isLeader {
+				if byMe {
 					DPrintf("kv%d: rpc%d channel not exist", kv.me, rpcId)
 				}
 			}
 		} else {
+			DPrintf("kv%d: apply message %v", kv.me, &msg)
 			data := msg.Command.(string)
 			if data == "kill" {
 				DPrintf("kv%d: kill apply worker", kv.me)
@@ -254,7 +259,7 @@ func (kv *KVServer) checkOpTrace() {
 		for k, v := range kv.rpcTrace {
 			dur := now.Sub(v)
 			if dur.Milliseconds() > MaxWaitTime {
-				DPrintf("kv%d: rpc#%d waits too long", kv.me, k)
+				DPrintf("kv%d: rpc#%d waits too long. rf.lockAt = %d", kv.me, k, kv.rf.GetLockAt())
 			}
 		}
 		kv.Unlock()
