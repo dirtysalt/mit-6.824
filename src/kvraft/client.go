@@ -3,7 +3,6 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
-	"sync"
 	"sync/atomic"
 
 	"../labrpc"
@@ -14,32 +13,21 @@ type Clerk struct {
 	// You will have to modify this struct.
 	clientId  int32
 	requestId int32
-	mu        sync.Mutex
-	leaderIdx int
+	leaderIdx int32
 }
 
 var GlobalClientId int32 = 0
 var GlobalRpcId int32 = 0
 
 const (
-	RetryWaitTime = 50
+	RetryWaitTime = 500
 )
 
-func (ck *Clerk) Lock() {
-	ck.mu.Lock()
-}
-func (ck *Clerk) Unlock() {
-	ck.mu.Unlock()
-}
 func (ck *Clerk) GetLeaderIdx() int {
-	ck.Lock()
-	defer ck.Unlock()
-	return ck.leaderIdx
+	return int(atomic.LoadInt32(&ck.leaderIdx))
 }
 func (ck *Clerk) SetLeaderIdx(v int) {
-	ck.Lock()
-	defer ck.Unlock()
-	ck.leaderIdx = v
+	atomic.StoreInt32(&ck.leaderIdx, int32(v))
 }
 
 func (ck *Clerk) newRequestId() int32 {
@@ -91,7 +79,7 @@ func (ck *Clerk) Get(key string) string {
 		reply := GetReply{}
 		req.RpcId = atomic.AddInt32(&GlobalRpcId, 1) - 1
 		ok := ck.servers[idx].Call(name, &req, &reply)
-		DPrintf("ck%d: kv%d:%s(%v) %s -> %s", ck.clientId, idx, name, ok, &req, &reply)
+		DPrintf("ck%d: %s(%v) %s -> %s", ck.clientId, name, ok, &req, &reply)
 		if !ok || reply.Err == ErrWrongLeader {
 			idx = (idx + 1) % len(ck.servers)
 			SleepMills(RetryWaitTime)
@@ -131,7 +119,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		reply := PutAppendReply{}
 		req.RpcId = atomic.AddInt32(&GlobalRpcId, 1) - 1
 		ok := ck.servers[idx].Call(name, &req, &reply)
-		DPrintf("ck%d: kv%d:%s(%v) %s -> %s", ck.clientId, idx, name, ok, &req, &reply)
+		DPrintf("ck%d: %s(%v) %s -> %s", ck.clientId, name, ok, &req, &reply)
 		if !ok || reply.Err == ErrWrongLeader {
 			idx = (idx + 1) % len(ck.servers)
 			SleepMills(RetryWaitTime)

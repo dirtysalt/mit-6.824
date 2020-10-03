@@ -12,9 +12,6 @@ import (
 )
 
 const (
-	OpAddChan   = "add-chan"
-	OpDelChan   = "del-chan"
-	OpQuit      = "quit"
 	MaxWaitTime = 5000
 )
 
@@ -31,7 +28,7 @@ type Op struct {
 }
 
 func (op *Op) String() string {
-	return fmt.Sprintf("op(cmd=%s, key=%s, value=%s, rpcId=%d, clientId=%d, requestId=%d)",
+	return fmt.Sprintf("op(cmd=%s, key=%s, value='%s', rpcId=%d, clientId=%d, requestId=%d)",
 		op.Cmd, op.Key, op.Value, op.RpcId, op.ClientId, op.RequestId)
 }
 
@@ -46,8 +43,10 @@ type KVServer struct {
 
 	// Your definitions here.
 	data       map[string]string
-	dup        map[int32]int32
+	dedup      map[int32]int32
 	applyIndex int
+	rpcTrace   map[int32]time.Time
+	rpcBinding map[int32]chan ApplyResult
 }
 
 func (kv *KVServer) Lock() {
@@ -65,24 +64,29 @@ type ApplyResult struct {
 }
 
 func (kv *KVServer) AddRpcChan(rpcId int32) chan ApplyResult {
+	kv.Lock()
+	defer kv.Unlock()
+
 	output := make(chan ApplyResult, 1)
-	cmd := raft.ApplyMsg{
-		CommandValid: false,
-		OpName:       OpAddChan,
-		RpcId:        rpcId,
-		Command:      output,
+	_, ok := kv.rpcBinding[rpcId]
+	if ok {
+		panic(fmt.Sprintf("kv%d: rpcId#%d has already been added", kv.me, rpcId))
 	}
-	kv.applyCh <- cmd
+	kv.rpcBinding[rpcId] = output
+	kv.rpcTrace[rpcId] = time.Now()
 	return output
 }
 
 func (kv *KVServer) DelRpcChan(rpcId int32) {
-	closeCmd := raft.ApplyMsg{
-		CommandValid: false,
-		OpName:       OpDelChan,
-		RpcId:        rpcId,
+	kv.Lock()
+	defer kv.Unlock()
+
+	_, ok := kv.rpcBinding[rpcId]
+	if !ok {
+		panic(fmt.Sprintf("rpcId#%d has already been deleted", rpcId))
 	}
-	kv.applyCh <- closeCmd
+	delete(kv.rpcBinding, rpcId)
+	delete(kv.rpcTrace, rpcId)
 }
 
 func (kv *KVServer) CallAndWait(op *Op) (ok bool, ans string) {
@@ -91,8 +95,10 @@ func (kv *KVServer) CallAndWait(op *Op) (ok bool, ans string) {
 	rpcId := op.RpcId
 	output := kv.AddRpcChan(rpcId)
 	defer kv.DelRpcChan(rpcId)
-	term, index, isLeader := kv.rf.Start(*op)
-	DPrintf("kv%d: start command %s -> reply(term=%d, index=%d, isLeader=%v)", kv.me, op, term, index, isLeader)
+
+	DPrintf("kv%d: start command %s", kv.me, op)
+	index, term, isLeader := kv.rf.Start(*op)
+	DPrintf("kv%d: rpc#%d -> reply(term=%d, index=%d, isLeader=%v)", kv.me, rpcId, term, index, isLeader)
 	if !isLeader {
 		return
 	}
@@ -100,7 +106,6 @@ func (kv *KVServer) CallAndWait(op *Op) (ok bool, ans string) {
 	select {
 	case res := <-output:
 		{
-
 			if res.Index != index {
 				panic(fmt.Sprintf("command index disagree. res = %d, exp = %d", res.Index, index))
 			}
@@ -161,12 +166,12 @@ func (kv *KVServer) applyOp(op *Op) (ans string) {
 	{
 		clientId := op.ClientId
 		requestId := op.RequestId
-		p, ok := kv.dup[clientId]
+		p, ok := kv.dedup[clientId]
 		if ok && p == requestId {
 			DPrintf("kv%d: duplicated message(clientId=%d, requestId=%d)", kv.me, clientId, requestId)
 			return
 		}
-		kv.dup[clientId] = requestId
+		kv.dedup[clientId] = requestId
 	}
 	key := op.Key
 	value := op.Value
@@ -201,8 +206,6 @@ func (kv *KVServer) applyOp(op *Op) (ans string) {
 }
 
 func (kv *KVServer) applyWorker() {
-	rpcBinding := make(map[int32]chan ApplyResult)
-
 	for {
 		msg := <-kv.applyCh
 		_, isLeader := kv.rf.GetState()
@@ -216,7 +219,9 @@ func (kv *KVServer) applyWorker() {
 			kv.applyIndex = msg.CommandIndex
 
 			rpcId := op.RpcId
-			ch, ok := rpcBinding[rpcId]
+			kv.Lock()
+			ch, ok := kv.rpcBinding[rpcId]
+			kv.Unlock()
 			res := ApplyResult{
 				Term:  msg.CommandTerm,
 				Index: msg.CommandIndex,
@@ -230,31 +235,30 @@ func (kv *KVServer) applyWorker() {
 				}
 			}
 		} else {
-			switch msg.OpName {
-			case OpAddChan:
-				{
-					rpcId := msg.RpcId
-					_, ok := rpcBinding[rpcId]
-					if ok {
-						panic(fmt.Sprintf("kv%d: rpcId:%d has already been added", kv.me, rpcId))
-					}
-					rpcBinding[rpcId] = msg.Command.(chan ApplyResult)
-				}
-			case OpDelChan:
-				{
-					rpcId := msg.RpcId
-					_, ok := rpcBinding[rpcId]
-					if !ok {
-						panic(fmt.Sprintf("rpcId:%d has already been deleted", rpcId))
-					}
-					delete(rpcBinding, rpcId)
-				}
-			case OpQuit:
+			data := msg.Command.(string)
+			if data == "kill" {
+				DPrintf("kv%d: kill apply worker", kv.me)
 				break
-			default:
-				panic(fmt.Sprintf("unknown opname: %s", msg.OpName))
 			}
 		}
+	}
+}
+
+func (kv *KVServer) checkOpTrace() {
+	for {
+		if kv.killed() {
+			break
+		}
+		kv.Lock()
+		now := time.Now()
+		for k, v := range kv.rpcTrace {
+			dur := now.Sub(v)
+			if dur.Milliseconds() > MaxWaitTime {
+				DPrintf("kv%d: rpc#%d waits too long", kv.me, k)
+			}
+		}
+		kv.Unlock()
+		SleepMills(MaxWaitTime)
 	}
 }
 
@@ -274,7 +278,7 @@ func (kv *KVServer) Kill() {
 	// Your code here, if desired.
 	msg := raft.ApplyMsg{
 		CommandValid: false,
-		OpName:       OpQuit,
+		Command:      "kill",
 	}
 	kv.applyCh <- msg
 }
@@ -314,7 +318,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
-	kv.dup = make(map[int32]int32)
+	kv.dedup = make(map[int32]int32)
+	kv.rpcTrace = make(map[int32]time.Time)
+	kv.rpcBinding = make(map[int32]chan ApplyResult)
 	go kv.applyWorker()
+	go kv.checkOpTrace()
 	return kv
 }

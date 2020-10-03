@@ -50,19 +50,11 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
-	// extra fields
-	OpName string
-	RpcId  int32
 }
 
 func (msg *ApplyMsg) String() string {
-	if msg.CommandValid {
-		return fmt.Sprintf("ApplyMsg(command=%v, term=%d, index=%d)",
-			msg.Command, msg.CommandTerm, msg.CommandIndex)
-	} else {
-		return fmt.Sprintf("ApplyMsg(opname=%s, rpcid=%d, command=%v)",
-			msg.OpName, msg.RpcId, msg.Command)
-	}
+	return fmt.Sprintf("ApplyMsg(command=%v, term=%d, index=%d)",
+		msg.Command, msg.CommandTerm, msg.CommandIndex)
 }
 
 type LogEntry struct {
