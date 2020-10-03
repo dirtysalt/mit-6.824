@@ -448,7 +448,7 @@ func GenericTestLinearizability(t *testing.T, part string, nclients int, nserver
 	}
 }
 
-func TestBasic3XA(t *testing.T) {
+func TestBasic3A(t *testing.T) {
 	// Test: one client (3A) ...
 	GenericTest(t, "3A", 1, false, false, false, -1)
 }

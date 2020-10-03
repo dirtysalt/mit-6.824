@@ -20,7 +20,7 @@ var GlobalClientId int32 = 0
 var GlobalRpcId int32 = 0
 
 const (
-	RetryWaitTime = 500
+	RetryWaitTime = 200
 )
 
 func (ck *Clerk) GetLeaderIdx() int {
