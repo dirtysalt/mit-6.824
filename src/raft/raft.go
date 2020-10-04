@@ -129,7 +129,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isLeader bool
 	// Your code here (2A).
 
-	rf.Lock(100)
+	rf.Lock(10)
 	defer rf.Unlock()
 
 	term = rf.currentTerm
@@ -256,7 +256,7 @@ func (rf *Raft) changeToFollower(term int, reason string) {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.Lock(200)
+	rf.Lock(20)
 	defer rf.Unlock()
 	trace := strings.Builder{}
 	defer func() {
@@ -323,7 +323,7 @@ func (x *AppendEntriesReply) String() string {
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
-	rf.Lock(300)
+	rf.Lock(30)
 	defer rf.Unlock()
 	reply.Success = false
 	reply.Term = rf.currentTerm
@@ -487,7 +487,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	rf.Lock(400)
+	rf.Lock(40)
 	defer rf.Unlock()
 
 	isLeader = rf.isLeader
@@ -578,7 +578,7 @@ func (rf *Raft) keepHeartbeat() {
 
 		_, isLeader := rf.GetState()
 		if isLeader {
-			rf.Lock(500)
+			rf.Lock(50)
 			rf.sendHeartbeat()
 			rf.Unlock()
 		}
@@ -595,7 +595,7 @@ func (rf *Raft) checkHeartbeat() {
 
 		do := false
 		now := time.Now()
-		rf.Lock(600)
+		rf.Lock(60)
 		off := now.Sub(rf.lasthb)
 		if off.Milliseconds() > (int64(electionTimeout) + (rand.Int63() % electionRandom)) {
 			do = true
@@ -650,7 +650,7 @@ func min(a, b int) int {
 }
 
 func (rf *Raft) changeToLeader() {
-	rf.Lock(700)
+	rf.Lock(70)
 	defer rf.Unlock()
 
 	rf.isLeader = true
@@ -684,7 +684,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 		if rf.killed() {
 			break
 		}
-		rf.Lock(800)
+		rf.Lock(80)
 		if !rf.okToRepl(peer) {
 			rf.SetLockAt(-1)
 			rf.replCond[peer].Wait()
@@ -722,7 +722,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 				continue
 			}
 
-			rf.Lock(801)
+			rf.Lock(81)
 			now := time.Now()
 			rf.followerhb[peer] = now
 			if !reply.Success {
@@ -753,7 +753,7 @@ func (rf *Raft) checkApplyProgress() {
 		if rf.killed() {
 			break
 		}
-		rf.Lock(900)
+		rf.Lock(90)
 		// DPrintf("X%d: commit-index = %d, last-applied = %d", rf.me, rf.commitIndex, rf.lastApplied)
 		if rf.commitIndex <= rf.lastApplied {
 			rf.SetLockAt(-1)
@@ -795,7 +795,7 @@ func (rf *Raft) checkCommitProgress() {
 		if rf.killed() {
 			break
 		}
-		rf.Lock(1000)
+		rf.Lock(100)
 		maxReplIndex := rf.maxReplicateIndex()
 		// DPrintf("X%d: max-repl-index = %d, commit-index = %d", rf.me, maxReplIndex, rf.commitIndex)
 		if maxReplIndex <= rf.commitIndex {
@@ -812,7 +812,7 @@ func (rf *Raft) checkCommitProgress() {
 func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
-	rf.Lock(1100)
+	rf.Lock(110)
 	rf.changeToFollower(rf.currentTerm+1, "electLeader")
 	// reset election timer
 	rf.lasthb = time.Now()
@@ -831,7 +831,7 @@ func (rf *Raft) electLeader() {
 			DPrintf("X%d: sendRequestVote to X%d: %v", rf.me, peer, &req)
 			if rf.sendRequestVote(peer, &req, &reply) {
 				valid := true
-				rf.Lock(1101)
+				rf.Lock(111)
 				// 如果修改了currentTerm的话，那么认为这轮就失败了
 				// 因为这里投票其实是投给req.Term
 				// 如果这里直接更新了currentTerm的话，那么就会出现两个leader.

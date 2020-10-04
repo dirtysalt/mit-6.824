@@ -43,11 +43,12 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data       map[string]string
-	dedup      map[int32]int32
-	applyIndex int
-	rpcTrace   map[int32]time.Time
-	rpcBinding map[int32]chan ApplyResult
+	data        map[string]string
+	dedup       map[int32]int32
+	applyIndex  int
+	applyTime   time.Time
+	rpcTrace    map[int32]time.Time
+	indexResult map[int]*ApplyResult
 }
 
 func (kv *KVServer) Lock() {
@@ -61,66 +62,64 @@ func (kv *KVServer) Unlock() {
 type ApplyResult struct {
 	Term  int
 	Index int
+	Err   Err
 	Value string
 }
 
-func (kv *KVServer) AddRpcChan(rpcId int32) chan ApplyResult {
+func (kv *KVServer) EnterRpc(rpcId int32) {
 	kv.Lock()
 	defer kv.Unlock()
-
-	output := make(chan ApplyResult, 1)
-	_, ok := kv.rpcBinding[rpcId]
-	if ok {
-		panic(fmt.Sprintf("kv%d: rpcId#%d has already been added", kv.me, rpcId))
-	}
-	kv.rpcBinding[rpcId] = output
 	kv.rpcTrace[rpcId] = time.Now()
-	return output
 }
 
-func (kv *KVServer) DelRpcChan(rpcId int32) {
+func (kv *KVServer) ExitRpc(rpcId int32) {
 	kv.Lock()
 	defer kv.Unlock()
-
-	_, ok := kv.rpcBinding[rpcId]
-	if !ok {
-		panic(fmt.Sprintf("rpcId#%d has already been deleted", rpcId))
-	}
-	delete(kv.rpcBinding, rpcId)
 	delete(kv.rpcTrace, rpcId)
 }
 
-func (kv *KVServer) CallAndWait(op *Op) (ok bool, ans string) {
-	ok, ans = false, ""
+func (kv *KVServer) SendIndexResult(index int, res *ApplyResult) {
+	kv.Lock()
+	defer kv.Unlock()
+	kv.indexResult[index] = res
+}
+
+func (kv *KVServer) WaitIndexResult(index int) *ApplyResult {
+	for {
+		kv.Lock()
+		res, ok := kv.indexResult[index]
+		kv.Unlock()
+		if ok {
+			return res
+		} else {
+			SleepMills(50)
+		}
+	}
+}
+
+func (kv *KVServer) CallAndWait(op *Op) (err Err, ans string) {
+	err, ans = ErrWrongLeader, ""
 
 	rpcId := op.RpcId
-	output := kv.AddRpcChan(rpcId)
-	defer kv.DelRpcChan(rpcId)
+	kv.EnterRpc(rpcId)
+	defer kv.ExitRpc(rpcId)
 
-	DPrintf("kv%d: start command %s", kv.me, op)
 	index, term, isLeader := kv.rf.Start(*op)
 	DPrintf("kv%d: rpc#%d -> reply(term=%d, index=%d, isLeader=%v)", kv.me, rpcId, term, index, isLeader)
 	if !isLeader {
 		return
 	}
 
-	select {
-	case res := <-output:
-		{
-			if res.Index != index {
-				panic(fmt.Sprintf("command index disagree. res = %d, exp = %d", res.Index, index))
-			}
-			if res.Term != term {
-				DPrintf("kv%d: %s -> term disagree. res = %d, exp = %d", kv.me, op, res.Term, term)
-				return
-			}
-			ok = true
-			ans = res.Value
-		}
-	case <-time.After(MaxWaitTime * time.Millisecond):
-		{
-			DPrintf("kv%d: timeout!!!!", kv.me)
-		}
+	res := kv.WaitIndexResult(index)
+	if res.Index != index {
+		panic(fmt.Sprintf("command index disagree. res = %d, exp = %d", res.Index, index))
+	}
+	if res.Term != term {
+		msg := fmt.Sprintf("kv%d: %s -> term disagree. res = %d, exp = %d", kv.me, op, res.Term, term)
+		DPrintf(msg)
+	} else {
+		err = res.Err
+		ans = res.Value
 	}
 	return
 }
@@ -136,12 +135,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	ok, value := kv.CallAndWait(&op)
-	reply.Err = ErrWrongLeader
-	if ok {
-		reply.Err = OK
-		reply.Value = value
-	}
+	err, value := kv.CallAndWait(&op)
+	reply.Err = err
+	reply.Value = value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -156,29 +152,34 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	ok, _ := kv.CallAndWait(&op)
-	reply.Err = ErrWrongLeader
-	if ok {
-		reply.Err = OK
-	}
+	err, _ := kv.CallAndWait(&op)
+	reply.Err = err
 }
 
-func (kv *KVServer) applyOp(op *Op) (ans string) {
+func (kv *KVServer) applyOp(op *Op) (err Err, ans string) {
 	ans = ""
-	// dedup first
-	{
-		clientId := op.ClientId
-		requestId := op.RequestId
-		p, ok := kv.dedup[clientId]
-		if ok && p == requestId {
-			DPrintf("kv%d: duplicated message(clientId=%d, requestId=%d)", kv.me, clientId, requestId)
-			return
-		}
-		kv.dedup[clientId] = requestId
-	}
+	err = OK
+
 	key := op.Key
 	value := op.Value
 	cmd := op.Cmd
+
+	// dedup first
+	clientId := op.ClientId
+	requestId := op.RequestId
+	p, ok := kv.dedup[clientId]
+	if ok && p == requestId {
+		if cmd == OpGet {
+			p, ok := kv.data[key]
+			if !ok {
+				p = ""
+			}
+			ans = p
+		}
+		DPrintf("kv%d: duplicated message(clientId=%d, requestId=%d)", kv.me, clientId, requestId)
+		return
+	}
+	kv.dedup[clientId] = requestId
 
 	switch cmd {
 	case OpGet:
@@ -196,11 +197,11 @@ func (kv *KVServer) applyOp(op *Op) (ans string) {
 				p = ""
 			}
 			p = p + value
-			kv.data[op.Key] = p
+			kv.data[key] = p
 		}
 	case OpPut:
 		{
-			kv.data[op.Key] = value
+			kv.data[key] = value
 		}
 	default:
 		panic(fmt.Sprintf("unknown cmd: %s", cmd))
@@ -212,32 +213,29 @@ func (kv *KVServer) applyWorker() {
 	for {
 		msg := <-kv.applyCh
 		if msg.CommandValid {
-			// TODO: apply
 			op := msg.Command.(Op)
 			byMe := (op.ServerId == kv.me)
 			if byMe {
-				DPrintf("kv%d: apply message %v", kv.me, &msg)
+				DPrintf("kv%d: apply message %v, term = %d, index = %d", kv.me, &op, msg.CommandTerm, msg.CommandIndex)
 			}
 
-			value := kv.applyOp(&op)
-			kv.applyIndex = msg.CommandIndex
+			err, value := kv.applyOp(&op)
+			// // if byMe {
+			// DPrintf("kv%d: data = %v", kv.me, kv.data)
+			// // }
 
-			rpcId := op.RpcId
 			kv.Lock()
-			ch, ok := kv.rpcBinding[rpcId]
+			kv.applyIndex = msg.CommandIndex
+			kv.applyTime = time.Now()
 			kv.Unlock()
+
 			res := ApplyResult{
 				Term:  msg.CommandTerm,
 				Index: msg.CommandIndex,
+				Err:   err,
 				Value: value,
 			}
-			if ok {
-				ch <- res
-			} else {
-				if byMe {
-					DPrintf("kv%d: rpc%d channel not exist", kv.me, rpcId)
-				}
-			}
+			kv.SendIndexResult(msg.CommandIndex, &res)
 		} else {
 			DPrintf("kv%d: apply message %v", kv.me, &msg)
 			data := msg.Command.(string)
@@ -249,7 +247,7 @@ func (kv *KVServer) applyWorker() {
 	}
 }
 
-func (kv *KVServer) checkOpTrace() {
+func (kv *KVServer) checkRpcTrace() {
 	for {
 		if kv.killed() {
 			break
@@ -261,6 +259,10 @@ func (kv *KVServer) checkOpTrace() {
 			if dur.Milliseconds() > MaxWaitTime {
 				DPrintf("kv%d: rpc#%d waits too long. rf.lockAt = %d", kv.me, k, kv.rf.GetLockAt())
 			}
+		}
+		dur := now.Sub(kv.applyTime)
+		if dur.Milliseconds() > MaxWaitTime {
+			DPrintf("kv%d: no message committed too long", kv.me)
 		}
 		kv.Unlock()
 		SleepMills(MaxWaitTime)
@@ -320,13 +322,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.applyTime = time.Now()
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.dedup = make(map[int32]int32)
 	kv.rpcTrace = make(map[int32]time.Time)
-	kv.rpcBinding = make(map[int32]chan ApplyResult)
+	kv.indexResult = make(map[int]*ApplyResult)
 	go kv.applyWorker()
-	go kv.checkOpTrace()
+	go kv.checkRpcTrace()
 	return kv
 }

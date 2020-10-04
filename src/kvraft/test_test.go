@@ -578,7 +578,7 @@ func TestManyPartitionsOneClient3A(t *testing.T) {
 	GenericTest(t, "3A", 1, false, false, true, -1)
 }
 
-func TestManyPartitionsManyClients3A(t *testing.T) {
+func TestManyPartitionsManyClients3XA(t *testing.T) {
 	// Test: partitions, many clients (3A) ...
 	GenericTest(t, "3A", 5, false, false, true, -1)
 }
