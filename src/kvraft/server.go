@@ -42,14 +42,16 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
 	// Your definitions here.
-	data       map[string]string
-	dedup      map[int32]int32
-	applyIndex int
-	applyTime  time.Time
-	rpcTrace   map[int32]time.Time
-	ansBuffer  map[int32]chan *ApplyAnswer
+	data           map[string]string
+	dedup          map[int32]int32
+	lastApplyIndex int
+	lastApplyTerm  int
+	lastApplyTime  time.Time
+	rpcTrace       map[int32]time.Time
+	ansBuffer      map[int32]chan *ApplyAnswer
 }
 
 func (kv *KVServer) Lock() {
@@ -96,9 +98,6 @@ func (kv *KVServer) DeleteRpcChan(rpcId int32) {
 func (kv *KVServer) SubmitAnswer(msg *raft.ApplyMsg, ans *ApplyAnswer) {
 	kv.Lock()
 	defer kv.Unlock()
-
-	kv.applyIndex = msg.CommandIndex
-	kv.applyTime = time.Now()
 
 	op := msg.Command.(Op)
 	if op.ServerId == kv.me {
@@ -264,7 +263,18 @@ func (kv *KVServer) applyWorker() {
 				DPrintf("kv%d: apply message %v, term = %d, index = %d", kv.me, &op, msg.CommandTerm, msg.CommandIndex)
 			}
 
+			kv.Lock()
+			// 如果这个日志已经执行过的话，那么就不要继续执行了
+			if msg.CommandIndex <= kv.lastApplyIndex {
+				kv.Unlock()
+				continue
+			}
 			err, value := kv.applyOp(&op)
+			kv.lastApplyIndex = msg.CommandIndex
+			kv.lastApplyTerm = msg.CommandTerm
+			kv.lastApplyTime = time.Now()
+			kv.Unlock()
+
 			// // if byMe {
 			// DPrintf("kv%d: data = %v", kv.me, kv.data)
 			// // }
@@ -280,13 +290,27 @@ func (kv *KVServer) applyWorker() {
 
 		} else {
 			DPrintf("kv%d: apply message %v", kv.me, &msg)
-			data := msg.Command.(string)
-			if data == "kill" {
+			op := msg.OpName
+			if op == "kill" {
 				DPrintf("kv%d: kill apply worker", kv.me)
 				break
+			} else if op == "install" {
+				DPrintf("kv%d: install snapshot", kv.me)
+				data := msg.Command.([]byte)
+				wait := msg.WaitChan
+				kv.installSnapshot(data)
+				wait <- "ok"
 			}
 		}
 	}
+}
+
+func (kv *KVServer) installSnapshot(data []byte) {
+	DPrintf("kv%d: install snapshot", kv.me)
+	kv.Lock()
+	defer kv.Unlock()
+	kv.readSnapshot(data)
+	kv.rf.DiscardLogs(kv.lastApplyIndex, kv.lastApplyTerm)
 }
 
 func (kv *KVServer) writeSnapshot() []byte {
@@ -294,7 +318,8 @@ func (kv *KVServer) writeSnapshot() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.data)
 	e.Encode(kv.dedup)
-	e.Encode(kv.applyIndex)
+	e.Encode(kv.lastApplyIndex)
+	e.Encode(kv.lastApplyTerm)
 	data := w.Bytes()
 	return data
 }
@@ -304,7 +329,8 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	d := labgob.NewDecoder(r)
 	d.Decode(&kv.data)
 	d.Decode(&kv.dedup)
-	d.Decode(&kv.applyIndex)
+	d.Decode(&kv.lastApplyIndex)
+	d.Decode(&kv.lastApplyTerm)
 }
 
 func (kv *KVServer) logCompactionWorker() {
@@ -312,7 +338,7 @@ func (kv *KVServer) logCompactionWorker() {
 		return
 	}
 
-	const COMPACTION_RATIO = 0.8
+	const COMPACTION_RATIO = 0.5
 	for {
 		if kv.killed() {
 			break
@@ -322,11 +348,10 @@ func (kv *KVServer) logCompactionWorker() {
 			DPrintf("kv%d: make log compaction", kv.me)
 			kv.Lock()
 			snapshot := kv.writeSnapshot()
-			applyIndex := kv.applyIndex
 			kv.Unlock()
-			kv.rf.WriteSnapshot(snapshot, applyIndex)
+			kv.rf.LogCompaction(snapshot)
 		}
-		SleepMills(MaxWaitTime)
+		SleepMills(1000)
 	}
 }
 
@@ -343,7 +368,7 @@ func (kv *KVServer) checkRpcTrace() {
 				DPrintf("kv%d: rpc#%d waits too long. rf.lockAt = %d", kv.me, k, kv.rf.GetLockAt())
 			}
 		}
-		dur := now.Sub(kv.applyTime)
+		dur := now.Sub(kv.lastApplyTime)
 		if dur.Milliseconds() > MaxWaitTime {
 			DPrintf("kv%d: no message committed too long", kv.me)
 		}
@@ -368,7 +393,7 @@ func (kv *KVServer) Kill() {
 	// Your code here, if desired.
 	msg := raft.ApplyMsg{
 		CommandValid: false,
-		Command:      "kill",
+		OpName:       "kill",
 	}
 	kv.applyCh <- msg
 }
@@ -405,13 +430,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.dedup = make(map[int32]int32)
 	kv.rpcTrace = make(map[int32]time.Time)
 	kv.ansBuffer = make(map[int32]chan *ApplyAnswer)
-	kv.applyTime = time.Now()
+	kv.lastApplyTime = time.Now()
 
 	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.applyWorker()

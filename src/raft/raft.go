@@ -50,11 +50,19 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
+
+	// used when commandvalid = false
+	WaitChan chan string
+	OpName   string
 }
 
 func (msg *ApplyMsg) String() string {
-	return fmt.Sprintf("ApplyMsg(command=%v, term=%d, index=%d)",
-		msg.Command, msg.CommandTerm, msg.CommandIndex)
+	if msg.CommandValid {
+		return fmt.Sprintf("ApplyMsg(command=%v, term=%d, index=%d)",
+			msg.Command, msg.CommandTerm, msg.CommandIndex)
+	} else {
+		return fmt.Sprintf("ApplyMsg(opname=%s)", msg.OpName)
+	}
 }
 
 type LogEntry struct {
@@ -129,7 +137,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isLeader bool
 	// Your code here (2A).
 
-	rf.Lock(10)
+	rf.Lock(136)
 	defer rf.Unlock()
 
 	term = rf.currentTerm
@@ -203,13 +211,13 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.baseLogIndex)
 }
 
-func (rf *Raft) WriteSnapshot(snapshot []byte, applyIndex int) {
-	rf.Lock(103)
+func (rf *Raft) LogCompaction(snapshot []byte) {
+	rf.Lock(211)
 	defer rf.Unlock()
-	// 至少存放一个log用于对齐
-	start := applyIndex - rf.baseLogIndex
-	rf.logs = rf.logs[start:]
-	rf.baseLogIndex = start
+	sz := len(rf.logs)
+	trunc := sz / 2
+	rf.logs = rf.logs[trunc:]
+	rf.baseLogIndex += trunc
 	state := rf.writeState()
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
 }
@@ -261,6 +269,16 @@ func (rf *Raft) getLogEntry(index int) *LogEntry {
 	return log
 }
 
+func (rf *Raft) DiscardLogs(index int, term int) {
+	rf.Lock(269)
+	defer rf.Unlock()
+	rf.logs = []LogEntry{
+		{Command: nil, Term: term},
+	}
+	rf.lastLogIndex = index
+	rf.baseLogIndex = index
+}
+
 var DEBUG_DUMP_LOGS = 0
 
 func (rf *Raft) dumpLogs() {
@@ -293,7 +311,7 @@ func (rf *Raft) changeToFollower(term int, reason string) {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.Lock(20)
+	rf.Lock(310)
 	defer rf.Unlock()
 	trace := strings.Builder{}
 	defer func() {
@@ -362,7 +380,7 @@ func (x *AppendEntriesReply) String() string {
 }
 
 func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesReply) {
-	rf.Lock(30)
+	rf.Lock(379)
 	defer rf.Unlock()
 	reply.Success = false
 	reply.Term = rf.currentTerm
@@ -466,6 +484,42 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	return
 }
 
+type InstallSnapshotRequest struct {
+	Term     int
+	LeaderId int
+	Snapshot []byte
+}
+type InstallSnapshotReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnapshotReply) {
+	rf.Lock(494)
+
+	reply.Success = false
+	reply.Term = rf.currentTerm
+
+	if req.Term < rf.currentTerm {
+		rf.Unlock()
+		return
+	}
+	rf.leaderId = req.LeaderId
+	rf.Unlock()
+
+	// TODO: 这里同步等待返回如何
+	reply.Success = true
+	wait := make(chan string)
+	msg := ApplyMsg{
+		CommandValid: false,
+		OpName:       "install",
+		Command:      req.Snapshot,
+		WaitChan:     wait,
+	}
+	rf.applyCh <- msg
+	<-wait
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -502,6 +556,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotRequest, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -547,7 +606,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	rf.Lock(40)
+	rf.Lock(604)
 	defer rf.Unlock()
 
 	isLeader = rf.isLeader
@@ -639,7 +698,7 @@ func (rf *Raft) keepHeartbeat() {
 
 		_, isLeader := rf.GetState()
 		if isLeader {
-			rf.Lock(50)
+			rf.Lock(696)
 			rf.sendHeartbeat()
 			rf.Unlock()
 		}
@@ -656,7 +715,7 @@ func (rf *Raft) checkHeartbeat() {
 
 		do := false
 		now := time.Now()
-		rf.Lock(60)
+		rf.Lock(713)
 		off := now.Sub(rf.lasthb)
 		if off.Milliseconds() > (int64(electionTimeout) + (rand.Int63() % electionRandom)) {
 			do = true
@@ -711,7 +770,7 @@ func min(a, b int) int {
 }
 
 func (rf *Raft) changeToLeader() {
-	rf.Lock(70)
+	rf.Lock(768)
 	defer rf.Unlock()
 
 	rf.isLeader = true
@@ -739,13 +798,13 @@ func (rf *Raft) okToRepl(peer int) bool {
 }
 
 func (rf *Raft) checkReplProgress(peer int) {
-	ok := false
+	ok := false // 记录上次是否成功
 
 	for {
 		if rf.killed() {
 			break
 		}
-		rf.Lock(80)
+		rf.Lock(802)
 		if !rf.okToRepl(peer) {
 			rf.SetLockAt(-1)
 			rf.replCond[peer].Wait()
@@ -754,6 +813,36 @@ func (rf *Raft) checkReplProgress(peer int) {
 			rf.markhb[peer] = false
 			prevIndex := rf.nextIndex[peer] - 1
 			lastIndex := rf.lastLogIndex
+
+			// 如果leader没有办法提供日志的话
+			// 那么需要发送snapshot.
+			if prevIndex < rf.baseLogIndex {
+				ok = false
+				req := InstallSnapshotRequest{
+					Term:     rf.currentTerm,
+					LeaderId: rf.me,
+					Snapshot: rf.persister.ReadSnapshot(),
+				}
+				reply := InstallSnapshotReply{}
+				rf.Unlock()
+
+				if !rf.sendInstallSnapshot(peer, &req, &reply) {
+					continue
+				}
+
+				rf.Lock(828)
+				if !reply.Success {
+					if reply.Term > rf.currentTerm {
+						rf.changeToFollower(reply.Term, "installSnapshot")
+					}
+				} else {
+					// 这可以随便设置一个点，等待下次同步
+					rf.nextIndex[peer] = lastIndex + 1
+				}
+				rf.Unlock()
+				continue
+			}
+
 			prevLog := rf.getLogEntry(prevIndex)
 			// 如果之前失败的话，那么首先发送一个空log去同步
 			if !ok {
@@ -785,7 +874,7 @@ func (rf *Raft) checkReplProgress(peer int) {
 				continue
 			}
 
-			rf.Lock(81)
+			rf.Lock(872)
 			now := time.Now()
 			rf.followerhb[peer] = now
 			if !reply.Success {
@@ -819,7 +908,7 @@ func (rf *Raft) checkApplyProgress() {
 		if rf.killed() {
 			break
 		}
-		rf.Lock(90)
+		rf.Lock(906)
 		// DPrintf("X%d: commit-index = %d, last-applied = %d", rf.me, rf.commitIndex, rf.lastApplied)
 		if rf.commitIndex <= rf.lastApplied {
 			rf.SetLockAt(-1)
@@ -861,7 +950,7 @@ func (rf *Raft) checkCommitProgress() {
 		if rf.killed() {
 			break
 		}
-		rf.Lock(100)
+		rf.Lock(948)
 		maxReplIndex := rf.maxReplicateIndex()
 		// DPrintf("X%d: max-repl-index = %d, commit-index = %d", rf.me, maxReplIndex, rf.commitIndex)
 		if maxReplIndex <= rf.commitIndex {
@@ -878,7 +967,7 @@ func (rf *Raft) checkCommitProgress() {
 func (rf *Raft) electLeader() {
 	req := RequestVoteArgs{}
 
-	rf.Lock(110)
+	rf.Lock(965)
 	rf.changeToFollower(rf.currentTerm+1, "electLeader")
 	// reset election timer
 	rf.lasthb = time.Now()
@@ -897,7 +986,7 @@ func (rf *Raft) electLeader() {
 			DPrintf("X%d: sendRequestVote to X%d: %v", rf.me, peer, &req)
 			if rf.sendRequestVote(peer, &req, &reply) {
 				valid := true
-				rf.Lock(111)
+				rf.Lock(984)
 				// 如果修改了currentTerm的话，那么认为这轮就失败了
 				// 因为这里投票其实是投给req.Term
 				// 如果这里直接更新了currentTerm的话，那么就会出现两个leader.

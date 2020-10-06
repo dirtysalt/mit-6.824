@@ -6,6 +6,15 @@ import (
 	"time"
 )
 
+const Debug = 1
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf("[KVRAFT] "+format, a...)
+	}
+	return
+}
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
@@ -19,15 +28,6 @@ type Err string
 
 func SleepMills(v int) {
 	time.Sleep(time.Duration(v) * time.Millisecond)
-}
-
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf("[KVRAFT] "+format, a...)
-	}
-	return
 }
 
 // Put or Append
