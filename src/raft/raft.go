@@ -143,6 +143,19 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+
+func (rf *Raft) writeState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.logs)
+	e.Encode(rf.lastLogIndex)
+	e.Encode(rf.baseLogIndex)
+	data := w.Bytes()
+	return data
+}
+
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -155,14 +168,7 @@ func (rf *Raft) persist() {
 
 	// disable persist first.
 	if true {
-		w := new(bytes.Buffer)
-		e := labgob.NewEncoder(w)
-		e.Encode(rf.votedFor)
-		e.Encode(rf.currentTerm)
-		e.Encode(rf.logs)
-		e.Encode(rf.lastLogIndex)
-		e.Encode(rf.baseLogIndex)
-		data := w.Bytes()
+		data := rf.writeState()
 		rf.persister.SaveRaftState(data)
 	}
 }
@@ -195,6 +201,17 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.logs)
 	d.Decode(&rf.lastLogIndex)
 	d.Decode(&rf.baseLogIndex)
+}
+
+func (rf *Raft) WriteSnapshot(snapshot []byte, applyIndex int) {
+	rf.Lock(103)
+	defer rf.Unlock()
+	// 至少存放一个log用于对齐
+	start := applyIndex - rf.baseLogIndex
+	rf.logs = rf.logs[start:]
+	rf.baseLogIndex = start
+	state := rf.writeState()
+	rf.persister.SaveStateAndSnapshot(state, snapshot)
 }
 
 //

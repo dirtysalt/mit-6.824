@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -276,6 +277,7 @@ func (kv *KVServer) applyWorker() {
 			}
 
 			kv.SubmitAnswer(&msg, &ans)
+
 		} else {
 			DPrintf("kv%d: apply message %v", kv.me, &msg)
 			data := msg.Command.(string)
@@ -284,6 +286,47 @@ func (kv *KVServer) applyWorker() {
 				break
 			}
 		}
+	}
+}
+
+func (kv *KVServer) writeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	e.Encode(kv.dedup)
+	e.Encode(kv.applyIndex)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	d.Decode(&kv.data)
+	d.Decode(&kv.dedup)
+	d.Decode(&kv.applyIndex)
+}
+
+func (kv *KVServer) logCompactionWorker() {
+	if kv.maxraftstate == -1 {
+		return
+	}
+
+	const COMPACTION_RATIO = 0.8
+	for {
+		if kv.killed() {
+			break
+		}
+		size := kv.persister.RaftStateSize()
+		if float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
+			DPrintf("kv%d: make log compaction", kv.me)
+			kv.Lock()
+			snapshot := kv.writeSnapshot()
+			applyIndex := kv.applyIndex
+			kv.Unlock()
+			kv.rf.WriteSnapshot(snapshot, applyIndex)
+		}
+		SleepMills(MaxWaitTime)
 	}
 }
 
@@ -362,14 +405,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.applyTime = time.Now()
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.dedup = make(map[int32]int32)
 	kv.rpcTrace = make(map[int32]time.Time)
 	kv.ansBuffer = make(map[int32]chan *ApplyAnswer)
+	kv.applyTime = time.Now()
+
+	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.applyWorker()
 	go kv.checkRpcTrace()
+	go kv.logCompactionWorker()
 	return kv
 }
