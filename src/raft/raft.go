@@ -229,8 +229,9 @@ func (reply *RequestVoteReply) String() string {
 }
 
 func (rf *Raft) lastLogEntry() *LogEntry {
-	sz := len(rf.logs)
-	return &rf.logs[sz-1]
+	// sz := len(rf.logs)
+	// return &rf.logs[sz-1]
+	return rf.getLogEntry(rf.lastLogIndex)
 }
 
 func (rf *Raft) lastLogTerm() (term int) {
@@ -241,6 +242,25 @@ func (rf *Raft) lastLogTerm() (term int) {
 func (rf *Raft) getLogEntry(index int) *LogEntry {
 	log := &rf.logs[index-rf.baseLogIndex]
 	return log
+}
+
+var DEBUG_DUMP_LOGS = 0
+
+func (rf *Raft) dumpLogs() {
+	if DEBUG_DUMP_LOGS == 0 {
+		return
+	}
+
+	output := strings.Builder{}
+	index := rf.baseLogIndex
+	output.WriteString("[")
+	for i := 0; i < len(rf.logs); i++ {
+		output.WriteString(fmt.Sprintf("%d:%d ", index, rf.logs[i].Term))
+		index += 1
+	}
+	output.WriteString("]")
+	msg := output.String()
+	DPrintf("X%d: [LOGS] %s", rf.me, msg)
 }
 
 func (rf *Raft) changeToFollower(term int, reason string) {
@@ -282,14 +302,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		trace.WriteString("[update higher term]")
 		rf.changeToFollower(args.Term, "RequestVote")
 	}
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if rf.votedFor == -1 {
 		lastTerm := rf.lastLogTerm()
 		if (args.LastLogTerm > lastTerm) || (args.LastLogTerm == lastTerm && args.LastLogIndex >= rf.lastLogIndex) {
 			rf.votedFor = args.CandidateId
-			reply.VoteGranted = true
 		}
+		trace.WriteString(fmt.Sprintf("[req(t=%d,i=%d), me(t=%d,i=%d)]", args.LastLogTerm, args.LastLogIndex, lastTerm, rf.lastLogIndex))
 	}
-
+	if rf.votedFor == args.CandidateId {
+		reply.VoteGranted = true
+	}
 	if reply.VoteGranted {
 		trace.WriteString(fmt.Sprintf("[voted for %d]", args.CandidateId))
 	}
@@ -348,6 +370,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		rf.changeToFollower(req.Term, "AppendEntries")
 	}
 	rf.leaderId = req.LeaderId
+	fastRollback := true
 
 	idx := req.PrevLogIndex - rf.baseLogIndex
 	if idx >= len(rf.logs) || rf.logs[idx].Term != req.PrevLogTerm {
@@ -357,19 +380,37 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		} else {
 			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
 				rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
-			if rf.logs[idx].Term > req.PrevLogTerm {
-				panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
-			}
-			searchTerm := rf.logs[idx].Term - 1
-			rb := 0
-			for idx >= 0 && rf.logs[idx].Term > searchTerm && (idx+rf.baseLogIndex) > rf.commitIndex {
+			if fastRollback {
+
+				// 下面这个逻辑是正常的
+				// 实验中遇到了这样的情况
+				// x0 351(16)
+				// x1 351(16)
+				// x2 351(16)
+				// x3 351(16) 352(16) 353(16)
+				// x4 351(16) 352(16) 353(16)
+				// 在351这里commit. 之后x0,x1,x2组成一个group, 并且在x0后面增加了一个352(17)
+				// 之后x1,x2,x3,x4组成group, 并且同步了logs: 351(16) 352(16) 353(16)
+				// 最后x0重新加入，这个时候需要覆盖351. 正确的term是16，而x0上是17
+
+				// if rf.logs[idx].Term > req.PrevLogTerm {
+				// 	panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
+				// }
+
+				searchTerm := rf.logs[idx].Term - 1
+				rb := 0
+				for idx >= 0 && rf.logs[idx].Term > searchTerm && (idx+rf.baseLogIndex) > rf.commitIndex {
+					idx -= 1
+					rb += 1
+				}
+				DPrintf("X%d: rollback %d entries", rf.me, rb)
+
+			} else {
 				idx -= 1
-				rb += 1
 			}
 			if idx < 0 {
 				panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
 			}
-			DPrintf("X%d: rollback %d entries", rf.me, rb)
 		}
 		reply.SyncIndex = idx + rf.baseLogIndex
 		reply.Conflict = true
@@ -391,12 +432,14 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	}
 	rf.logs = rf.logs[:idx]
 	rf.lastLogIndex = idx - 1 + rf.baseLogIndex
+	rf.dumpLogs()
 
 	// 这里更新commitIndex前提是logs已经完全一致了
 	if req.LeaderCommitIndex > rf.commitIndex {
 		trace.WriteString("[update commit index]")
-		DPrintf("X%d: update commit index %d->%d(%d)", rf.me, rf.commitIndex, req.LeaderCommitIndex, rf.lastLogIndex)
+		prevCommitIndex := rf.commitIndex
 		rf.commitIndex = min(req.LeaderCommitIndex, rf.lastLogIndex)
+		DPrintf("X%d: update commit index %d->%d. lastLogIndex=%d", rf.me, prevCommitIndex, rf.commitIndex, rf.lastLogIndex)
 		rf.applyCond.Signal()
 	}
 
@@ -500,10 +543,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 		}
 		rf.logs = append(rf.logs, log)
+		rf.dumpLogs()
 		rf.checkLogsSize()
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
-		// DPrintf("X%d: set next[%d]=%d, match[%d]=%d", rf.me, rf.me, rf.nextIndex[rf.me], rf.me, rf.matchIndex[rf.me])
+		DPrintf("X%d: next[X%d]=%d, match[X%d]=%d", rf.me, rf.me, rf.nextIndex[rf.me], rf.me, rf.matchIndex[rf.me])
 		rf.signalRepl()
 		rf.persist()
 		DPrintf("X%d: Start command. index = %d, term = %d", rf.me, index, term)
@@ -716,7 +760,9 @@ func (rf *Raft) checkReplProgress(peer int) {
 			reply := AppendEntriesReply{}
 			rf.Unlock()
 
-			DPrintf("X%d: sendAppendEntries to X%d: %v", rf.me, peer, &req)
+			sz := len(req.Entries)
+			DPrintf("X%d: sendAppendEntries to X%d: %v. lastIndex=%d, sz=%d", rf.me, peer, &req, lastIndex, sz)
+
 			// 本次发送失败，可能是follower不可达
 			if !rf.sendAppendEntries(peer, &req, &reply) {
 				continue
@@ -736,9 +782,12 @@ func (rf *Raft) checkReplProgress(peer int) {
 				ok = false
 			} else {
 				// accept logs[prevIndex+1:lastIndex+1]
+				changed := (rf.matchIndex[peer] != lastIndex)
 				rf.nextIndex[peer] = lastIndex + 1
 				rf.matchIndex[peer] = lastIndex
-				// DPrintf("X%d: set next[%d]=%d, match[%d]=%d", rf.me, peer, rfq.nextIndex[peer], peer, rf.matchIndex[peer])
+				if changed {
+					DPrintf("X%d: next[X%d]=%d, match[X%d]=%d", rf.me, peer, rf.nextIndex[peer], peer, rf.matchIndex[peer])
+				}
 				rf.commitCond.Signal()
 				ok = true
 			}

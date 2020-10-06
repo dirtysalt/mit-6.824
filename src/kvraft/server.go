@@ -43,12 +43,12 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data        map[string]string
-	dedup       map[int32]int32
-	applyIndex  int
-	applyTime   time.Time
-	rpcTrace    map[int32]time.Time
-	indexResult map[int]*ApplyResult
+	data       map[string]string
+	dedup      map[int32]int32
+	applyIndex int
+	applyTime  time.Time
+	rpcTrace   map[int32]time.Time
+	ansBuffer  map[int32]chan *ApplyAnswer
 }
 
 func (kv *KVServer) Lock() {
@@ -59,7 +59,7 @@ func (kv *KVServer) Unlock() {
 	kv.mu.Unlock()
 }
 
-type ApplyResult struct {
+type ApplyAnswer struct {
 	Term  int
 	Index int
 	Err   Err
@@ -78,21 +78,56 @@ func (kv *KVServer) ExitRpc(rpcId int32) {
 	delete(kv.rpcTrace, rpcId)
 }
 
-func (kv *KVServer) SendIndexResult(index int, res *ApplyResult) {
+func (kv *KVServer) CreateRpcChan(rpcId int32) chan *ApplyAnswer {
+	ch := make(chan *ApplyAnswer, 1)
 	kv.Lock()
 	defer kv.Unlock()
-	kv.indexResult[index] = res
+	kv.ansBuffer[rpcId] = ch
+	return ch
 }
 
-func (kv *KVServer) WaitIndexResult(index int) *ApplyResult {
+func (kv *KVServer) DeleteRpcChan(rpcId int32) {
+	kv.Lock()
+	defer kv.Unlock()
+	delete(kv.ansBuffer, rpcId)
+}
+
+func (kv *KVServer) SubmitAnswer(msg *raft.ApplyMsg, ans *ApplyAnswer) {
+	kv.Lock()
+	defer kv.Unlock()
+
+	kv.applyIndex = msg.CommandIndex
+	kv.applyTime = time.Now()
+
+	op := msg.Command.(Op)
+	if op.ServerId == kv.me {
+		rpcId := op.RpcId
+		ch := kv.ansBuffer[rpcId]
+		if ch != nil {
+			ch <- ans
+		}
+	}
+}
+
+func (kv *KVServer) WaitAnswer(index int, term int, ch chan *ApplyAnswer) *ApplyAnswer {
 	for {
-		kv.Lock()
-		res, ok := kv.indexResult[index]
-		kv.Unlock()
-		if ok {
-			return res
-		} else {
-			SleepMills(50)
+		if kv.killed() {
+			return nil
+		}
+
+		currentTerm, _ := kv.rf.GetState()
+		if currentTerm != term {
+			return nil
+		}
+
+		select {
+		case ans := <-ch:
+			{
+				return ans
+			}
+		case <-time.After(500 * time.Millisecond):
+			{
+			}
 		}
 	}
 }
@@ -103,14 +138,23 @@ func (kv *KVServer) CallAndWait(op *Op) (err Err, ans string) {
 	rpcId := op.RpcId
 	kv.EnterRpc(rpcId)
 	defer kv.ExitRpc(rpcId)
+	defer func() {
+		DPrintf("kv%d: return rpc#%d -> reply(%s,'%s')", kv.me, rpcId, err, ans)
+	}()
+
+	ch := kv.CreateRpcChan(rpcId)
+	defer kv.DeleteRpcChan(rpcId)
 
 	index, term, isLeader := kv.rf.Start(*op)
-	DPrintf("kv%d: rpc#%d -> reply(term=%d, index=%d, isLeader=%v)", kv.me, rpcId, term, index, isLeader)
+	DPrintf("kv%d: start rpc#%d -> reply(term=%d, index=%d, isLeader=%v)", kv.me, rpcId, term, index, isLeader)
 	if !isLeader {
 		return
 	}
 
-	res := kv.WaitIndexResult(index)
+	res := kv.WaitAnswer(index, term, ch)
+	if res == nil {
+		return
+	}
 	if res.Index != index {
 		panic(fmt.Sprintf("command index disagree. res = %d, exp = %d", res.Index, index))
 	}
@@ -224,18 +268,14 @@ func (kv *KVServer) applyWorker() {
 			// DPrintf("kv%d: data = %v", kv.me, kv.data)
 			// // }
 
-			kv.Lock()
-			kv.applyIndex = msg.CommandIndex
-			kv.applyTime = time.Now()
-			kv.Unlock()
-
-			res := ApplyResult{
+			ans := ApplyAnswer{
 				Term:  msg.CommandTerm,
 				Index: msg.CommandIndex,
 				Err:   err,
 				Value: value,
 			}
-			kv.SendIndexResult(msg.CommandIndex, &res)
+
+			kv.SubmitAnswer(&msg, &ans)
 		} else {
 			DPrintf("kv%d: apply message %v", kv.me, &msg)
 			data := msg.Command.(string)
@@ -328,7 +368,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)
 	kv.dedup = make(map[int32]int32)
 	kv.rpcTrace = make(map[int32]time.Time)
-	kv.indexResult = make(map[int]*ApplyResult)
+	kv.ansBuffer = make(map[int32]chan *ApplyAnswer)
 	go kv.applyWorker()
 	go kv.checkRpcTrace()
 	return kv
