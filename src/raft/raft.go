@@ -54,6 +54,7 @@ type ApplyMsg struct {
 	// used when commandvalid = false
 	WaitChan chan string
 	OpName   string
+	RpcId    int32
 }
 
 func (msg *ApplyMsg) String() string {
@@ -61,7 +62,7 @@ func (msg *ApplyMsg) String() string {
 		return fmt.Sprintf("ApplyMsg(command=%v, term=%d, index=%d)",
 			msg.Command, msg.CommandTerm, msg.CommandIndex)
 	} else {
-		return fmt.Sprintf("ApplyMsg(opname=%s)", msg.OpName)
+		return fmt.Sprintf("ApplyMsg(opname=%s, rpcId=%d)", msg.OpName, msg.RpcId)
 	}
 }
 
@@ -70,14 +71,22 @@ type LogEntry struct {
 	Term    int
 }
 
+var GlobalRpcId int32 = 0
+
 const (
-	sendHeartbeatInterval  = 200
-	loseConnectionTimeout  = sendHeartbeatInterval * 8
-	checkHeartbeatInterval = 50
-	electionTimeout        = 300
-	electionRandom         = 100
-	maxNumberLogEntries    = 100
+	sendHeartbeatInterval       = 200
+	loseConnectionTimeout       = sendHeartbeatInterval * 8
+	checkHeartbeatInterval      = 50
+	electionTimeout             = 300
+	electionRandom              = 100
+	maxNumberLogEntries         = 100
+	installSnapshotFailedWait   = 50
+	sendAppendEntriesFailedWait = 50
 )
+
+func newRpcId() int32 {
+	return atomic.AddInt32(&GlobalRpcId, 1)
+}
 
 //
 // A Go object implementing a single Raft peer.
@@ -152,7 +161,7 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 
-func (rf *Raft) writeState() []byte {
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.votedFor)
@@ -176,7 +185,7 @@ func (rf *Raft) persist() {
 
 	// disable persist first.
 	if true {
-		data := rf.writeState()
+		data := rf.encodeState()
 		rf.persister.SaveRaftState(data)
 	}
 }
@@ -211,15 +220,17 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.baseLogIndex)
 }
 
-func (rf *Raft) LogCompaction(snapshot []byte) {
+func (rf *Raft) LogCompaction(snapshot []byte, applyIndex int, preservedNumber int) {
 	rf.Lock(211)
 	defer rf.Unlock()
-	sz := len(rf.logs)
-	trunc := sz / 2
-	rf.logs = rf.logs[trunc:]
-	rf.baseLogIndex += trunc
-	state := rf.writeState()
+	discard := max(applyIndex-rf.baseLogIndex-preservedNumber, 0)
+	rf.logs = rf.logs[discard:]
+	rf.baseLogIndex += discard
+	DPrintf("X%d: log compaction. applyIndex=%d, rf.lastApplied=%d, rf.commitIndex=%d, baseIndex=%d",
+		rf.me, applyIndex, rf.lastApplied, rf.commitIndex, rf.baseLogIndex)
+	state := rf.encodeState()
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
+	rf.dumpLogs()
 }
 
 //
@@ -232,11 +243,12 @@ type RequestVoteArgs struct {
 	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
+	RpcId        int32
 }
 
 func (args *RequestVoteArgs) String() string {
-	return fmt.Sprintf("req(term=%d, candId=%d, logIndex=%d, logTerm=%d)",
-		args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+	return fmt.Sprintf("req(term=%d, candId=%d, logIndex=%d, logTerm=%d, rpcId=%d)",
+		args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm, args.RpcId)
 }
 
 //
@@ -272,14 +284,17 @@ func (rf *Raft) getLogEntry(index int) *LogEntry {
 func (rf *Raft) DiscardLogs(index int, term int) {
 	rf.Lock(269)
 	defer rf.Unlock()
+	DPrintf("X%d: discard logs. set logs index = %d", index)
 	rf.logs = []LogEntry{
 		{Command: nil, Term: term},
 	}
 	rf.lastLogIndex = index
 	rf.baseLogIndex = index
+	rf.lastApplied = index
+	rf.commitIndex = index
 }
 
-var DEBUG_DUMP_LOGS = 0
+var DEBUG_DUMP_LOGS = 1
 
 func (rf *Raft) dumpLogs() {
 	if DEBUG_DUMP_LOGS == 0 {
@@ -295,7 +310,7 @@ func (rf *Raft) dumpLogs() {
 	}
 	output.WriteString("]")
 	msg := output.String()
-	DPrintf("X%d: [LOGS] %s", rf.me, msg)
+	DPrintf("X%d: [LOGS] %s. baseIndex=%d, lastIndex=%d", rf.me, msg, rf.baseLogIndex, rf.lastLogIndex)
 }
 
 func (rf *Raft) changeToFollower(term int, reason string) {
@@ -360,11 +375,12 @@ type AppendEntriesRequest struct {
 	PrevLogTerm       int
 	Entries           []LogEntry
 	LeaderCommitIndex int
+	RpcId             int32
 }
 
 func (req *AppendEntriesRequest) String() string {
-	return fmt.Sprintf("req(term=%d, leaderId=%d, prevIndex=%d, prevTerm=%d, leaderCommitIndex=%d)",
-		req.Term, req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, req.LeaderCommitIndex)
+	return fmt.Sprintf("req(term=%d, leaderId=%d, prevIndex=%d, prevTerm=%d, leaderCommitIndex=%d, rpcId=%d)",
+		req.Term, req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, req.LeaderCommitIndex, req.RpcId)
 }
 
 type AppendEntriesReply struct {
@@ -488,14 +504,26 @@ type InstallSnapshotRequest struct {
 	Term     int
 	LeaderId int
 	Snapshot []byte
+	RpcId    int32
 }
 type InstallSnapshotReply struct {
 	Term    int
 	Success bool
 }
 
+func (req *InstallSnapshotRequest) String() string {
+	return fmt.Sprintf("req(term=%d, leaderId=%d, rpcId=%d)", req.Term, req.LeaderId, req.RpcId)
+}
+
+func (reply *InstallSnapshotReply) String() string {
+	return fmt.Sprintf("reply(term=%d, ok=%v)", reply.Term, reply.Success)
+}
+
 func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnapshotReply) {
 	rf.Lock(494)
+	defer func() {
+		DPrintf("X%d: InstallSnapshot:%v -> %s", rf.me, req, reply)
+	}()
 
 	reply.Success = false
 	reply.Term = rf.currentTerm
@@ -515,6 +543,7 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 		OpName:       "install",
 		Command:      req.Snapshot,
 		WaitChan:     wait,
+		RpcId:        req.RpcId,
 	}
 	rf.applyCh <- msg
 	<-wait
@@ -809,97 +838,108 @@ func (rf *Raft) checkReplProgress(peer int) {
 			rf.SetLockAt(-1)
 			rf.replCond[peer].Wait()
 			rf.Unlock()
-		} else {
-			rf.markhb[peer] = false
-			prevIndex := rf.nextIndex[peer] - 1
-			lastIndex := rf.lastLogIndex
+			continue
+		}
 
-			// 如果leader没有办法提供日志的话
-			// 那么需要发送snapshot.
-			if prevIndex < rf.baseLogIndex {
-				ok = false
-				req := InstallSnapshotRequest{
-					Term:     rf.currentTerm,
-					LeaderId: rf.me,
-					Snapshot: rf.persister.ReadSnapshot(),
-				}
-				reply := InstallSnapshotReply{}
-				rf.Unlock()
+		rf.markhb[peer] = false
+		prevIndex := rf.nextIndex[peer] - 1
+		lastIndex := rf.lastLogIndex
 
-				if !rf.sendInstallSnapshot(peer, &req, &reply) {
-					continue
-				}
-
-				rf.Lock(828)
-				if !reply.Success {
-					if reply.Term > rf.currentTerm {
-						rf.changeToFollower(reply.Term, "installSnapshot")
-					}
-				} else {
-					// 这可以随便设置一个点，等待下次同步
-					rf.nextIndex[peer] = lastIndex + 1
-				}
-				rf.Unlock()
-				continue
+		// 如果leader没有办法提供日志的话
+		// 那么需要发送snapshot.
+		if prevIndex < rf.baseLogIndex {
+			rpcId := newRpcId()
+			DPrintf("X%d: can not send logs to X%d. rpcId=%d, prevIndex=%d, baseIndex=%d. install snapshot", rf.me, peer, rpcId, prevIndex, rf.baseLogIndex)
+			ok = false
+			req := InstallSnapshotRequest{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				RpcId:    rpcId,
 			}
-
-			prevLog := rf.getLogEntry(prevIndex)
-			// 如果之前失败的话，那么首先发送一个空log去同步
-			if !ok {
-				lastIndex = prevIndex
-			}
-
-			// 控制单次最多发送的数量
-			if lastIndex-prevIndex > maxNumberLogEntries {
-				lastIndex = prevIndex + maxNumberLogEntries
-			}
-
-			req := AppendEntriesRequest{
-				Term:              rf.currentTerm,
-				LeaderId:          rf.me,
-				PrevLogIndex:      prevIndex,
-				PrevLogTerm:       prevLog.Term,
-				LeaderCommitIndex: rf.commitIndex,
-				Entries:           rf.logs[prevIndex+1-rf.baseLogIndex : lastIndex+1-rf.baseLogIndex],
-			}
-
-			reply := AppendEntriesReply{}
+			reply := InstallSnapshotReply{}
 			rf.Unlock()
+			req.Snapshot = rf.persister.ReadSnapshot()
 
-			sz := len(req.Entries)
-			DPrintf("X%d: sendAppendEntries to X%d: %v. lastIndex=%d, sz=%d", rf.me, peer, &req, lastIndex, sz)
-
-			// 本次发送失败，可能是follower不可达
-			if !rf.sendAppendEntries(peer, &req, &reply) {
+			if !rf.sendInstallSnapshot(peer, &req, &reply) {
+				DPrintf("X%d: install snapshot rpcId=%d failed", rf.me, rpcId)
+				sleepMills(installSnapshotFailedWait)
 				continue
 			}
 
-			rf.Lock(872)
-			now := time.Now()
-			rf.followerhb[peer] = now
+			rf.Lock(828)
 			if !reply.Success {
 				if reply.Term > rf.currentTerm {
-					rf.changeToFollower(reply.Term, "checkReplProgress")
+					rf.changeToFollower(reply.Term, "installSnapshot")
 				}
-				if reply.Conflict {
-					// term confliction
-					rf.nextIndex[peer] = reply.SyncIndex + 1
-				}
-				ok = false
 			} else {
-				// accept logs[prevIndex+1:lastIndex+1]
-				changed := (rf.matchIndex[peer] != lastIndex)
+				// 这可以随便设置一个点，等待下次同步
 				rf.nextIndex[peer] = lastIndex + 1
-				rf.matchIndex[peer] = lastIndex
-				if changed {
-					DPrintf("X%d: next[X%d]=%d, match[X%d]=%d", rf.me, peer, rf.nextIndex[peer], peer, rf.matchIndex[peer])
-				}
-				rf.commitCond.Signal()
-				ok = true
 			}
-
 			rf.Unlock()
+			continue
 		}
+
+		prevLog := rf.getLogEntry(prevIndex)
+		// 如果之前失败的话，那么首先发送一个空log去同步
+		if !ok {
+			lastIndex = prevIndex
+		}
+
+		// 控制单次最多发送的数量
+		if lastIndex-prevIndex > maxNumberLogEntries {
+			lastIndex = prevIndex + maxNumberLogEntries
+		}
+
+		rpcId := newRpcId()
+		req := AppendEntriesRequest{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			PrevLogIndex:      prevIndex,
+			PrevLogTerm:       prevLog.Term,
+			LeaderCommitIndex: rf.commitIndex,
+			Entries:           rf.logs[prevIndex+1-rf.baseLogIndex : lastIndex+1-rf.baseLogIndex],
+			RpcId:             rpcId,
+		}
+
+		reply := AppendEntriesReply{}
+		rf.Unlock()
+
+		sz := len(req.Entries)
+		DPrintf("X%d: sendAppendEntries to X%d: %v. lastIndex=%d, sz=%d", rf.me, peer, &req, lastIndex, sz)
+
+		// 本次发送失败，可能是follower不可达
+		if !rf.sendAppendEntries(peer, &req, &reply) {
+			DPrintf("X%d: send append entries rpcId=%d faied", rf.me, rpcId)
+			sleepMills(sendAppendEntriesFailedWait)
+			continue
+		}
+
+		rf.Lock(872)
+		now := time.Now()
+		rf.followerhb[peer] = now
+		if !reply.Success {
+			if reply.Term > rf.currentTerm {
+				rf.changeToFollower(reply.Term, "checkReplProgress")
+			}
+			if reply.Conflict {
+				// term confliction
+				rf.nextIndex[peer] = reply.SyncIndex + 1
+			}
+			ok = false
+		} else {
+			// accept logs[prevIndex+1:lastIndex+1]
+			changed := (rf.matchIndex[peer] != lastIndex)
+			rf.nextIndex[peer] = lastIndex + 1
+			rf.matchIndex[peer] = lastIndex
+			if changed {
+				DPrintf("X%d: next[X%d]=%d, match[X%d]=%d", rf.me, peer, rf.nextIndex[peer], peer, rf.matchIndex[peer])
+			}
+			rf.commitCond.Signal()
+			ok = true
+		}
+
+		rf.Unlock()
+
 	}
 }
 
@@ -914,7 +954,7 @@ func (rf *Raft) checkApplyProgress() {
 			rf.SetLockAt(-1)
 			rf.applyCond.Wait()
 		} else {
-			DPrintf("X%d: commit logs at [%d,%d]", rf.me, rf.lastApplied+1, rf.commitIndex)
+			DPrintf("X%d: commit logs at [%d,%d]. baseIndex = %d", rf.me, rf.lastApplied+1, rf.commitIndex, rf.baseLogIndex)
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				log := rf.getLogEntry(i)
 				msg := ApplyMsg{
@@ -976,6 +1016,7 @@ func (rf *Raft) electLeader() {
 	req.CandidateId = rf.me
 	req.LastLogIndex = rf.lastLogIndex
 	req.LastLogTerm = rf.lastLogTerm()
+	req.RpcId = newRpcId()
 	rf.Unlock()
 
 	DPrintf("X%d: electLeader ...", rf.me)
@@ -1058,6 +1099,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.commitIndex = rf.baseLogIndex
+	rf.lastApplied = rf.baseLogIndex
 
 	go rf.checkHeartbeat()
 	go rf.keepHeartbeat()

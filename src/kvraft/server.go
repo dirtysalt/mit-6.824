@@ -12,10 +12,6 @@ import (
 	"../raft"
 )
 
-const (
-	MaxWaitTime = 5000
-)
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -69,19 +65,19 @@ type ApplyAnswer struct {
 	Value string
 }
 
-func (kv *KVServer) EnterRpc(rpcId int32) {
+func (kv *KVServer) enterRpc(rpcId int32) {
 	kv.Lock()
 	defer kv.Unlock()
 	kv.rpcTrace[rpcId] = time.Now()
 }
 
-func (kv *KVServer) ExitRpc(rpcId int32) {
+func (kv *KVServer) exitRpc(rpcId int32) {
 	kv.Lock()
 	defer kv.Unlock()
 	delete(kv.rpcTrace, rpcId)
 }
 
-func (kv *KVServer) CreateRpcChan(rpcId int32) chan *ApplyAnswer {
+func (kv *KVServer) createRpcChan(rpcId int32) chan *ApplyAnswer {
 	ch := make(chan *ApplyAnswer, 1)
 	kv.Lock()
 	defer kv.Unlock()
@@ -89,7 +85,7 @@ func (kv *KVServer) CreateRpcChan(rpcId int32) chan *ApplyAnswer {
 	return ch
 }
 
-func (kv *KVServer) DeleteRpcChan(rpcId int32) {
+func (kv *KVServer) deleteRpcChan(rpcId int32) {
 	kv.Lock()
 	defer kv.Unlock()
 	delete(kv.ansBuffer, rpcId)
@@ -132,18 +128,18 @@ func (kv *KVServer) WaitAnswer(index int, term int, ch chan *ApplyAnswer) *Apply
 	}
 }
 
-func (kv *KVServer) CallAndWait(op *Op) (err Err, ans string) {
+func (kv *KVServer) StartAndWait(op *Op) (err Err, ans string) {
 	err, ans = ErrWrongLeader, ""
 
 	rpcId := op.RpcId
-	kv.EnterRpc(rpcId)
-	defer kv.ExitRpc(rpcId)
+	kv.enterRpc(rpcId)
+	defer kv.exitRpc(rpcId)
 	defer func() {
 		DPrintf("kv%d: return rpc#%d -> reply(%s,'%s')", kv.me, rpcId, err, ans)
 	}()
 
-	ch := kv.CreateRpcChan(rpcId)
-	defer kv.DeleteRpcChan(rpcId)
+	ch := kv.createRpcChan(rpcId)
+	defer kv.deleteRpcChan(rpcId)
 
 	index, term, isLeader := kv.rf.Start(*op)
 	DPrintf("kv%d: start rpc#%d -> reply(term=%d, index=%d, isLeader=%v)", kv.me, rpcId, term, index, isLeader)
@@ -179,7 +175,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	err, value := kv.CallAndWait(&op)
+	err, value := kv.StartAndWait(&op)
 	reply.Err = err
 	reply.Value = value
 }
@@ -196,7 +192,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	err, _ := kv.CallAndWait(&op)
+	err, _ := kv.StartAndWait(&op)
 	reply.Err = err
 }
 
@@ -295,7 +291,7 @@ func (kv *KVServer) applyWorker() {
 				DPrintf("kv%d: kill apply worker", kv.me)
 				break
 			} else if op == "install" {
-				DPrintf("kv%d: install snapshot", kv.me)
+				DPrintf("kv%d: install snapshot. rpcId=%d", kv.me, msg.RpcId)
 				data := msg.Command.([]byte)
 				wait := msg.WaitChan
 				kv.installSnapshot(data)
@@ -306,14 +302,13 @@ func (kv *KVServer) applyWorker() {
 }
 
 func (kv *KVServer) installSnapshot(data []byte) {
-	DPrintf("kv%d: install snapshot", kv.me)
 	kv.Lock()
 	defer kv.Unlock()
-	kv.readSnapshot(data)
+	kv.decodeSnapshot(data)
 	kv.rf.DiscardLogs(kv.lastApplyIndex, kv.lastApplyTerm)
 }
 
-func (kv *KVServer) writeSnapshot() []byte {
+func (kv *KVServer) encodeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.data)
@@ -324,7 +319,7 @@ func (kv *KVServer) writeSnapshot() []byte {
 	return data
 }
 
-func (kv *KVServer) readSnapshot(data []byte) {
+func (kv *KVServer) decodeSnapshot(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	d.Decode(&kv.data)
@@ -338,24 +333,29 @@ func (kv *KVServer) logCompactionWorker() {
 		return
 	}
 
-	const COMPACTION_RATIO = 0.5
+	const COMPACTION_RATIO = 2
+	const CHECK_INTERVAL = 100
+	const PRESERVED_NUMBER = 10
+
 	for {
 		if kv.killed() {
 			break
 		}
 		size := kv.persister.RaftStateSize()
 		if float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
-			DPrintf("kv%d: make log compaction", kv.me)
+			DPrintf("kv%d: make log compaction, current size = %d, threshold = %d", kv.me, size, kv.maxraftstate)
 			kv.Lock()
-			snapshot := kv.writeSnapshot()
+			snapshot := kv.encodeSnapshot()
+			applyIndex := kv.lastApplyIndex
 			kv.Unlock()
-			kv.rf.LogCompaction(snapshot)
+			kv.rf.LogCompaction(snapshot, applyIndex, PRESERVED_NUMBER)
 		}
-		SleepMills(1000)
+		SleepMills(CHECK_INTERVAL)
 	}
 }
 
 func (kv *KVServer) checkRpcTrace() {
+	const MAX_WAIT_TIME = 5000
 	for {
 		if kv.killed() {
 			break
@@ -364,16 +364,16 @@ func (kv *KVServer) checkRpcTrace() {
 		now := time.Now()
 		for k, v := range kv.rpcTrace {
 			dur := now.Sub(v)
-			if dur.Milliseconds() > MaxWaitTime {
+			if dur.Milliseconds() > MAX_WAIT_TIME {
 				DPrintf("kv%d: rpc#%d waits too long. rf.lockAt = %d", kv.me, k, kv.rf.GetLockAt())
 			}
 		}
 		dur := now.Sub(kv.lastApplyTime)
-		if dur.Milliseconds() > MaxWaitTime {
+		if dur.Milliseconds() > MAX_WAIT_TIME {
 			DPrintf("kv%d: no message committed too long", kv.me)
 		}
 		kv.Unlock()
-		SleepMills(MaxWaitTime)
+		SleepMills(MAX_WAIT_TIME)
 	}
 }
 
@@ -439,7 +439,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.ansBuffer = make(map[int32]chan *ApplyAnswer)
 	kv.lastApplyTime = time.Now()
 
-	kv.readSnapshot(persister.ReadSnapshot())
+	kv.decodeSnapshot(persister.ReadSnapshot())
 	go kv.applyWorker()
 	go kv.checkRpcTrace()
 	go kv.logCompactionWorker()
