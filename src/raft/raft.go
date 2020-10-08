@@ -285,11 +285,16 @@ func (rf *Raft) getLogEntry(index int) *LogEntry {
 func (rf *Raft) DiscardLogs(index int, term int) {
 	rf.Lock(269)
 	defer rf.Unlock()
-	DPrintf("X%d: discard logs. set logs index = %d", index)
-	rf.logs = []*LogEntry{
-		{Command: nil, Term: term},
+	DPrintf("X%d: discard logs. set logs index = %d, lastIndex = %d", rf.me, index, rf.lastLogIndex)
+	if index <= rf.lastLogIndex {
+		idx := index - rf.baseLogIndex
+		rf.logs = rf.logs[idx:]
+	} else {
+		rf.logs = []*LogEntry{
+			{Command: nil, Term: term},
+		}
 	}
-	rf.lastLogIndex = index
+	rf.lastLogIndex = index + len(rf.logs) - 1
 	rf.baseLogIndex = index
 	rf.lastApplied = index
 	rf.commitIndex = index
@@ -422,48 +427,54 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 		rf.changeToFollower(req.Term, "AppendEntries")
 	}
 	rf.leaderId = req.LeaderId
-	fastRollback := true
 
 	idx := req.PrevLogIndex - rf.baseLogIndex
-	if idx >= len(rf.logs) || rf.logs[idx].Term != req.PrevLogTerm {
-		if idx >= len(rf.logs) {
-			DPrintf("X%d: mismatch log entry. too short", rf.me)
-			idx = len(rf.logs) - 1
-		} else {
-			DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
-				rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
-			if fastRollback {
+	conflict := true
+	// 因为logcompaction会造成idx < 0
+	if idx < 0 || idx >= len(rf.logs) {
+		DPrintf("X%d: mismatch log entry size. idx = %d, sz = %d", rf.me, idx, len(rf.logs))
+		idx = len(rf.logs) - 1
+	} else if idx >= 0 && rf.logs[idx].Term != req.PrevLogTerm {
+		fastRollback := true
 
-				// 下面这个逻辑是正常的
-				// 实验中遇到了这样的情况
-				// x0 351(16)
-				// x1 351(16)
-				// x2 351(16)
-				// x3 351(16) 352(16) 353(16)
-				// x4 351(16) 352(16) 353(16)
-				// 在351这里commit. 之后x0,x1,x2组成一个group, 并且在x0后面增加了一个352(17)
-				// 之后x1,x2,x3,x4组成group, 并且同步了logs: 351(16) 352(16) 353(16)
-				// 最后x0重新加入，这个时候需要覆盖351. 正确的term是16，而x0上是17
+		DPrintf("X%d: mismatch log entry. index = %v, leader term = %v, my term = %v",
+			rf.me, req.PrevLogIndex, req.PrevLogTerm, rf.logs[idx].Term)
+		if fastRollback {
 
-				// if rf.logs[idx].Term > req.PrevLogTerm {
-				// 	panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
-				// }
+			// 下面这个逻辑是正常的
+			// 实验中遇到了这样的情况
+			// x0 351(16)
+			// x1 351(16)
+			// x2 351(16)
+			// x3 351(16) 352(16) 353(16)
+			// x4 351(16) 352(16) 353(16)
+			// 在351这里commit. 之后x0,x1,x2组成一个group, 并且在x0后面增加了一个352(17)
+			// 之后x1,x2,x3,x4组成group, 并且同步了logs: 351(16) 352(16) 353(16)
+			// 最后x0重新加入，这个时候需要覆盖351. 正确的term是16，而x0上是17
 
-				searchTerm := rf.logs[idx].Term - 1
-				rb := 0
-				for idx >= 0 && rf.logs[idx].Term > searchTerm && (idx+rf.baseLogIndex) > rf.commitIndex {
-					idx -= 1
-					rb += 1
-				}
-				DPrintf("X%d: rollback %d entries", rf.me, rb)
+			// if rf.logs[idx].Term > req.PrevLogTerm {
+			// 	panic(fmt.Sprintf("X%d: conflict term assert error: %d, %d", rf.me, rf.logs[idx].Term, req.PrevLogTerm))
+			// }
 
-			} else {
+			searchTerm := rf.logs[idx].Term - 1
+			rb := 0
+			for idx >= 0 && rf.logs[idx].Term > searchTerm && (idx+rf.baseLogIndex) > rf.commitIndex {
 				idx -= 1
+				rb += 1
 			}
-			if idx < 0 {
-				panic(fmt.Sprintf("X%d: retry index < 0", rf.me))
-			}
+			DPrintf("X%d: rollback %d entries", rf.me, rb)
+		} else {
+			idx -= 1
 		}
+		if idx < 0 {
+			rf.dumpLogs()
+			panic(fmt.Sprintf("X%d: can not find sync index", rf.me))
+		}
+	} else {
+		conflict = false
+	}
+
+	if conflict {
 		reply.SyncIndex = idx + rf.baseLogIndex
 		reply.Conflict = true
 		return

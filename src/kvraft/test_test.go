@@ -608,7 +608,7 @@ func TestPersistPartitionUnreliable3A(t *testing.T) {
 	GenericTest(t, "3A", 5, true, true, true, -1)
 }
 
-func TestPersistPartitionUnreliableLinearizable3A(t *testing.T) {
+func TestPersistPartitionUnreliableLinearizable3XA(t *testing.T) {
 	// Test: unreliable net, restarts, partitions, linearizability checks (3A) ...
 	GenericTestLinearizability(t, "3A", 15, 7, true, true, true, -1)
 }
@@ -734,7 +734,7 @@ func TestSnapshotUnreliableRecoverConcurrentPartition3B(t *testing.T) {
 	GenericTest(t, "3B", 5, true, true, true, 1000)
 }
 
-func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B(t *testing.T) {
+func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3XB(t *testing.T) {
 	// Test: unreliable net, restarts, partitions, snapshots, linearizability checks (3B) ...
 	GenericTestLinearizability(t, "3B", 15, 7, true, true, true, 1000)
 }
