@@ -25,6 +25,11 @@ type Op struct {
 	RequestId int32
 }
 
+type OpResult struct {
+	RequestId int32
+	Value     string
+}
+
 func (op *Op) String() string {
 	return fmt.Sprintf("op(cmd=%s, key=%s, value='%s', serverId=%d, rpcId=%d, clientId=%d, requestId=%d)",
 		op.Cmd, op.Key, op.Value, op.ServerId, op.RpcId, op.ClientId, op.RequestId)
@@ -42,7 +47,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	data           map[string]string
-	dedup          map[int32]int32
+	dedup          map[int32]*OpResult
 	lastApplyIndex int
 	lastApplyTerm  int
 	lastApplyTime  time.Time
@@ -207,19 +212,15 @@ func (kv *KVServer) applyOp(op *Op) (err Err, ans string) {
 	// dedup first
 	clientId := op.ClientId
 	requestId := op.RequestId
+	serverId := op.ServerId
+	rpcId := op.RpcId
 	p, ok := kv.dedup[clientId]
-	if ok && p == requestId {
-		if cmd == OpGet {
-			p, ok := kv.data[key]
-			if !ok {
-				p = ""
-			}
-			ans = p
-		}
-		DPrintf("kv%d: duplicated message(clientId=%d, requestId=%d)", kv.me, clientId, requestId)
+	if ok && p.RequestId == requestId {
+		ans = p.Value
+		DPrintf("kv%d: duplicated message(cmd=%s, key=%s, clientId=%d, requestId=%d, rpcId=%d, serverId=%d)",
+			cmd, key, kv.me, clientId, requestId, rpcId, serverId)
 		return
 	}
-	kv.dedup[clientId] = requestId
 
 	switch cmd {
 	case OpGet:
@@ -246,6 +247,12 @@ func (kv *KVServer) applyOp(op *Op) (err Err, ans string) {
 	default:
 		panic(fmt.Sprintf("unknown cmd: %s", cmd))
 	}
+
+	res := OpResult{
+		RequestId: requestId,
+		Value:     ans,
+	}
+	kv.dedup[clientId] = &res
 	return
 }
 
@@ -434,7 +441,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
-	kv.dedup = make(map[int32]int32)
+	kv.dedup = make(map[int32]*OpResult)
 	kv.rpcTrace = make(map[int32]time.Time)
 	kv.ansBuffer = make(map[int32]chan *ApplyAnswer)
 	kv.lastApplyTime = time.Now()
