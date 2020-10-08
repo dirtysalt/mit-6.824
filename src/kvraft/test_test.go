@@ -608,7 +608,7 @@ func TestPersistPartitionUnreliable3A(t *testing.T) {
 	GenericTest(t, "3A", 5, true, true, true, -1)
 }
 
-func TestPersistPartitionUnreliableLinearizable3XA(t *testing.T) {
+func TestPersistPartitionUnreliableLinearizable3A(t *testing.T) {
 	// Test: unreliable net, restarts, partitions, linearizability checks (3A) ...
 	GenericTestLinearizability(t, "3A", 15, 7, true, true, true, -1)
 }
@@ -619,7 +619,7 @@ func TestPersistPartitionUnreliableLinearizable3XA(t *testing.T) {
 // also checks that majority discards committed log entries
 // even if minority doesn't respond.
 //
-func TestSnapshotRPC3AB(t *testing.T) {
+func TestSnapshotRPC3B(t *testing.T) {
 	const nservers = 3
 	maxraftstate := 1000
 	cfg := make_config(t, nservers, false, maxraftstate)
@@ -676,7 +676,7 @@ func TestSnapshotRPC3AB(t *testing.T) {
 
 // are the snapshots not too huge? 500 bytes is a generous bound for the
 // operations we're doing here.
-func TestSnapshotSize3AB(t *testing.T) {
+func TestSnapshotSize3B(t *testing.T) {
 	const nservers = 3
 	maxraftstate := 1000
 	maxsnapshotstate := 500
@@ -709,7 +709,7 @@ func TestSnapshotSize3AB(t *testing.T) {
 	cfg.end()
 }
 
-func TestSnapshotRecover3YB(t *testing.T) {
+func TestSnapshotRecover3B(t *testing.T) {
 	// Test: restarts, snapshots, one client (3B) ...
 	GenericTest(t, "3B", 1, false, true, false, 1000)
 }
@@ -734,7 +734,7 @@ func TestSnapshotUnreliableRecoverConcurrentPartition3B(t *testing.T) {
 	GenericTest(t, "3B", 5, true, true, true, 1000)
 }
 
-func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3XB(t *testing.T) {
+func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B(t *testing.T) {
 	// Test: unreliable net, restarts, partitions, snapshots, linearizability checks (3B) ...
 	GenericTestLinearizability(t, "3B", 15, 7, true, true, true, 1000)
 }

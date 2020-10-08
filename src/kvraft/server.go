@@ -215,7 +215,7 @@ func (kv *KVServer) applyOp(op *Op) (err Err, ans string) {
 	if ok && p.RequestId == requestId {
 		ans = p.Value
 		DPrintf("kv%d: duplicated message(cmd=%s, key=%s, clientId=%d, requestId=%d, rpcId=%d, serverId=%d)",
-			cmd, key, kv.me, clientId, requestId, rpcId, serverId)
+			kv.me, cmd, key, clientId, requestId, rpcId, serverId)
 		return
 	}
 
