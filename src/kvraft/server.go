@@ -308,8 +308,12 @@ func (kv *KVServer) applyWorker() {
 func (kv *KVServer) doInstallSnapshot(data []byte) {
 	kv.Lock()
 	defer kv.Unlock()
+	lastApplyIndex := kv.lastApplyIndex
 	kv.decodeSnapshot(data)
 	kv.rf.DiscardLogs(kv.lastApplyIndex, kv.lastApplyTerm)
+	if kv.lastApplyIndex < lastApplyIndex {
+		panic(fmt.Sprintf("kv%d: apply index goes backward %d->%d", kv.me, kv.lastApplyIndex, lastApplyIndex))
+	}
 }
 
 func (kv *KVServer) doLogCompaction() {
@@ -349,20 +353,16 @@ func (kv *KVServer) logCompactionWorker() {
 
 	const COMPACTION_RATIO = 2
 	const CHECK_INTERVAL = 100
-
-	lastSize := -1
 	for {
 		if kv.killed() {
 			break
 		}
 		size := kv.persister.RaftStateSize()
-		if lastSize != size && float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
+		if float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
 			DPrintf("kv%d: make log compaction, current size = %d, threshold = %d", kv.me, size, kv.maxraftstate)
 			kv.doLogCompaction()
-			lastSize = kv.persister.RaftStateSize()
-		} else {
-			SleepMills(CHECK_INTERVAL)
 		}
+		SleepMills(CHECK_INTERVAL)
 	}
 }
 

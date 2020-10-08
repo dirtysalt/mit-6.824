@@ -224,14 +224,15 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) LogCompaction(snapshot []byte, applyIndex int) {
 	rf.Lock(211)
 	defer rf.Unlock()
-	discard := applyIndex - 10 - rf.baseLogIndex
+	rf.dumpLogs("LogCompaction.Before")
+	discard := max(applyIndex-rf.baseLogIndex, 0)
 	rf.logs = rf.logs[discard:]
 	rf.baseLogIndex += discard
 	DPrintf("X%d: log compaction. applyIndex=%d, rf.lastApplied=%d, rf.commitIndex=%d, baseIndex=%d",
-		rf.me, applyIndex, rf.lastApplied, rf.commitIndex, rf.baseLogIndex)
+		applyIndex, rf.me, rf.lastApplied, rf.commitIndex, rf.baseLogIndex)
 	state := rf.encodeState()
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
-	rf.dumpLogs()
+	rf.dumpLogs("LogCompaction.After")
 }
 
 //
@@ -286,7 +287,8 @@ func (rf *Raft) DiscardLogs(index int, term int) {
 	rf.Lock(269)
 	defer rf.Unlock()
 	DPrintf("X%d: discard logs. set logs index = %d, lastIndex = %d", rf.me, index, rf.lastLogIndex)
-	if index <= rf.lastLogIndex {
+	// TODO: ???
+	if index <= rf.lastLogIndex && index >= rf.baseLogIndex {
 		idx := index - rf.baseLogIndex
 		rf.logs = rf.logs[idx:]
 	} else {
@@ -302,7 +304,7 @@ func (rf *Raft) DiscardLogs(index int, term int) {
 
 var DEBUG_DUMP_LOGS = 1
 
-func (rf *Raft) dumpLogs() {
+func (rf *Raft) dumpLogs(where string) {
 	if DEBUG_DUMP_LOGS == 0 {
 		return
 	}
@@ -316,7 +318,7 @@ func (rf *Raft) dumpLogs() {
 	}
 	output.WriteString("]")
 	msg := output.String()
-	DPrintf("X%d: [LOGS] %s. baseIndex=%d, lastIndex=%d", rf.me, msg, rf.baseLogIndex, rf.lastLogIndex)
+	DPrintf("X%d: [LOGS] where=%s, baseIndex=%d, lastIndex=%d. %s", rf.me, where, rf.baseLogIndex, rf.lastLogIndex, msg)
 }
 
 func (rf *Raft) changeToFollower(term int, reason string) {
@@ -432,7 +434,8 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	conflict := true
 	// 因为logcompaction会造成idx < 0
 	if idx < 0 || idx >= len(rf.logs) {
-		DPrintf("X%d: mismatch log entry size. idx = %d, sz = %d", rf.me, idx, len(rf.logs))
+		DPrintf("X%d: mismatch log entry size. prevIndex=%d, baseIndex=%d, lastIndex=%d",
+			req.PrevLogIndex, rf.baseLogIndex, rf.lastLogIndex)
 		idx = len(rf.logs) - 1
 	} else if idx >= 0 && rf.logs[idx].Term != req.PrevLogTerm {
 		fastRollback := true
@@ -467,7 +470,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 			idx -= 1
 		}
 		if idx < 0 {
-			rf.dumpLogs()
+			rf.dumpLogs("AppendEntries.Fatal")
 			panic(fmt.Sprintf("X%d: can not find sync index", rf.me))
 		}
 	} else {
@@ -495,7 +498,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	}
 	rf.logs = rf.logs[:idx]
 	rf.lastLogIndex = idx - 1 + rf.baseLogIndex
-	rf.dumpLogs()
+	rf.dumpLogs("AppendEntries")
 
 	// 这里更新commitIndex前提是logs已经完全一致了
 	if req.LeaderCommitIndex > rf.commitIndex {
@@ -713,7 +716,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    term,
 		}
 		rf.logs = append(rf.logs, &log)
-		rf.dumpLogs()
+		rf.dumpLogs("Start")
 		rf.checkLogsSize()
 		rf.nextIndex[rf.me] = index + 1
 		rf.matchIndex[rf.me] = index
