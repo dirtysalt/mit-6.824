@@ -96,10 +96,7 @@ func (kv *KVServer) deleteRpcChan(rpcId int32) {
 	delete(kv.ansBuffer, rpcId)
 }
 
-func (kv *KVServer) SubmitAnswer(msg *raft.ApplyMsg, ans *ApplyAnswer) {
-	kv.Lock()
-	defer kv.Unlock()
-
+func (kv *KVServer) submitAnswer(msg *raft.ApplyMsg, ans *ApplyAnswer) {
 	op := msg.Command.(Op)
 	if op.ServerId == kv.me {
 		rpcId := op.RpcId
@@ -133,7 +130,7 @@ func (kv *KVServer) WaitAnswer(index int, term int, ch chan *ApplyAnswer) *Apply
 	}
 }
 
-func (kv *KVServer) StartAndWait(op *Op) (err Err, ans string) {
+func (kv *KVServer) StartAndWaitAnswer(op *Op) (err Err, ans string) {
 	err, ans = ErrWrongLeader, ""
 
 	rpcId := op.RpcId
@@ -180,7 +177,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	err, value := kv.StartAndWait(&op)
+	err, value := kv.StartAndWaitAnswer(&op)
 	reply.Err = err
 	reply.Value = value
 }
@@ -197,7 +194,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
 	}
-	err, _ := kv.StartAndWait(&op)
+	err, _ := kv.StartAndWaitAnswer(&op)
 	reply.Err = err
 }
 
@@ -276,7 +273,6 @@ func (kv *KVServer) applyWorker() {
 			kv.lastApplyIndex = msg.CommandIndex
 			kv.lastApplyTerm = msg.CommandTerm
 			kv.lastApplyTime = time.Now()
-			kv.Unlock()
 
 			// // if byMe {
 			// DPrintf("kv%d: data = %v", kv.me, kv.data)
@@ -289,7 +285,8 @@ func (kv *KVServer) applyWorker() {
 				Value: value,
 			}
 
-			kv.SubmitAnswer(&msg, &ans)
+			kv.submitAnswer(&msg, &ans)
+			kv.Unlock()
 
 		} else {
 			DPrintf("kv%d: apply message %v", kv.me, &msg)
@@ -301,18 +298,28 @@ func (kv *KVServer) applyWorker() {
 				DPrintf("kv%d: install snapshot. rpcId=%d", kv.me, msg.RpcId)
 				data := msg.Command.([]byte)
 				wait := msg.WaitChan
-				kv.installSnapshot(data)
+				kv.doInstallSnapshot(data)
 				wait <- "ok"
 			}
 		}
 	}
 }
 
-func (kv *KVServer) installSnapshot(data []byte) {
+func (kv *KVServer) doInstallSnapshot(data []byte) {
 	kv.Lock()
 	defer kv.Unlock()
 	kv.decodeSnapshot(data)
 	kv.rf.DiscardLogs(kv.lastApplyIndex, kv.lastApplyTerm)
+}
+
+func (kv *KVServer) doLogCompaction() {
+	// log compaction 和 install snapshot 过程要对应上
+	// 这个过程先对kv加锁，在对rf加锁
+	kv.Lock()
+	defer kv.Unlock()
+	snapshot := kv.encodeSnapshot()
+	applyIndex := kv.lastApplyIndex
+	kv.rf.LogCompaction(snapshot, applyIndex)
 }
 
 func (kv *KVServer) encodeSnapshot() []byte {
@@ -342,22 +349,20 @@ func (kv *KVServer) logCompactionWorker() {
 
 	const COMPACTION_RATIO = 2
 	const CHECK_INTERVAL = 100
-	const PRESERVED_NUMBER = 10
 
+	lastSize := -1
 	for {
 		if kv.killed() {
 			break
 		}
 		size := kv.persister.RaftStateSize()
-		if float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
+		if lastSize != size && float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
 			DPrintf("kv%d: make log compaction, current size = %d, threshold = %d", kv.me, size, kv.maxraftstate)
-			kv.Lock()
-			snapshot := kv.encodeSnapshot()
-			applyIndex := kv.lastApplyIndex
-			kv.Unlock()
-			kv.rf.LogCompaction(snapshot, applyIndex, PRESERVED_NUMBER)
+			kv.doLogCompaction()
+			lastSize = kv.persister.RaftStateSize()
+		} else {
+			SleepMills(CHECK_INTERVAL)
 		}
-		SleepMills(CHECK_INTERVAL)
 	}
 }
 
@@ -395,6 +400,7 @@ func (kv *KVServer) checkRpcTrace() {
 // to suppress debug output from a Kill()ed instance.
 //
 func (kv *KVServer) Kill() {
+	DPrintf("kv%d: killed.", kv.me)
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
@@ -450,5 +456,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go kv.applyWorker()
 	go kv.checkRpcTrace()
 	go kv.logCompactionWorker()
+	DPrintf("kv%d: restart.", kv.me)
 	return kv
 }

@@ -221,10 +221,10 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.baseLogIndex)
 }
 
-func (rf *Raft) LogCompaction(snapshot []byte, applyIndex int, preservedNumber int) {
+func (rf *Raft) LogCompaction(snapshot []byte, applyIndex int) {
 	rf.Lock(211)
 	defer rf.Unlock()
-	discard := max(applyIndex-rf.baseLogIndex-preservedNumber, 0)
+	discard := applyIndex - 10 - rf.baseLogIndex
 	rf.logs = rf.logs[discard:]
 	rf.baseLogIndex += discard
 	DPrintf("X%d: log compaction. applyIndex=%d, rf.lastApplied=%d, rf.commitIndex=%d, baseIndex=%d",
@@ -737,7 +737,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 //
+
 func (rf *Raft) Kill() {
+	DPrintf("X%d: killed.", rf.me)
 	atomic.StoreInt32(&rf.dead, 1)
 	rf.applyCond.Broadcast()
 	rf.commitCond.Broadcast()
@@ -1046,8 +1048,12 @@ func (rf *Raft) checkApplyProgress() {
 		if rf.commitIndex <= rf.lastApplied {
 			rf.SetLockAt(-1)
 			rf.applyCond.Wait()
+			rf.Unlock()
+
 		} else {
 			DPrintf("X%d: commit logs at [%d,%d]. baseIndex = %d", rf.me, rf.lastApplied+1, rf.commitIndex, rf.baseLogIndex)
+			msgs := []*ApplyMsg{}
+
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				log := rf.getLogEntry(i)
 				msg := ApplyMsg{
@@ -1056,15 +1062,22 @@ func (rf *Raft) checkApplyProgress() {
 					CommandIndex: i,
 					CommandTerm:  log.Term,
 				}
-				DPrintf("X%d: commit msg = %v", rf.me, &msg)
-				if rf.isLeader {
-					DPrintf("X%d: Leader Commit. index = %d, msg = %v", rf.me, i, &msg)
-				}
-				rf.applyCh <- msg
+				msgs = append(msgs, &msg)
 			}
+
+			isLeader := rf.isLeader
 			rf.lastApplied = rf.commitIndex
+			rf.Unlock()
+
+			for i := 0; i < len(msgs); i++ {
+				msg := msgs[i]
+				rf.applyCh <- *msg
+				DPrintf("X%d: commit msg = %v", rf.me, msg)
+				if isLeader {
+					DPrintf("X%d: Leader Commit. index = %d, msg = %v", rf.me, i, msg)
+				}
+			}
 		}
-		rf.Unlock()
 	}
 }
 
@@ -1204,5 +1217,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		go rf.checkReplProgress(i)
 		go rf.keepHeartbeatWorker(i)
 	}
+
+	DPrintf("X%d: restart.", rf.me)
 	return rf
 }
