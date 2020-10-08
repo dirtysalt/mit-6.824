@@ -112,7 +112,7 @@ type Raft struct {
 	leaderId     int
 	lasthb       time.Time // election timer
 	lasthbLeader time.Time // 用于快速否定request vote
-	logs         []LogEntry
+	logs         []*LogEntry
 	currentTerm  int // last term server has ever seen
 	votedFor     int // candidate voted in current term
 	commitIndex  int
@@ -278,7 +278,7 @@ func (rf *Raft) lastLogTerm() (term int) {
 }
 
 func (rf *Raft) getLogEntry(index int) *LogEntry {
-	log := &rf.logs[index-rf.baseLogIndex]
+	log := rf.logs[index-rf.baseLogIndex]
 	return log
 }
 
@@ -286,7 +286,7 @@ func (rf *Raft) DiscardLogs(index int, term int) {
 	rf.Lock(269)
 	defer rf.Unlock()
 	DPrintf("X%d: discard logs. set logs index = %d", index)
-	rf.logs = []LogEntry{
+	rf.logs = []*LogEntry{
 		{Command: nil, Term: term},
 	}
 	rf.lastLogIndex = index
@@ -374,7 +374,7 @@ type AppendEntriesRequest struct {
 	LeaderId          int
 	PrevLogIndex      int
 	PrevLogTerm       int
-	Entries           []LogEntry
+	Entries           []*LogEntry
 	LeaderCommitIndex int
 	RpcId             int32
 }
@@ -701,7 +701,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Command: command,
 			Term:    term,
 		}
-		rf.logs = append(rf.logs, log)
+		rf.logs = append(rf.logs, &log)
 		rf.dumpLogs()
 		rf.checkLogsSize()
 		rf.nextIndex[rf.me] = index + 1
@@ -1164,7 +1164,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.logs = []LogEntry{
+	rf.logs = []*LogEntry{
 		{
 			Command: nil,
 			Term:    0,
