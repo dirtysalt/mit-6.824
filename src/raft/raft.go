@@ -77,8 +77,8 @@ const (
 	sendHeartbeatInterval       = 200
 	loseConnectionTimeout       = sendHeartbeatInterval * 8
 	checkHeartbeatInterval      = 50
-	electionTimeout             = 300
-	electionRandom              = 100
+	electionTimeoutBase         = 300
+	electionTimeoutRandom       = 100
 	maxNumberLogEntries         = 100
 	installSnapshotFailedWait   = 50
 	sendAppendEntriesFailedWait = 50
@@ -100,6 +100,7 @@ type Raft struct {
 	applyCond  *sync.Cond
 	commitCond *sync.Cond
 	replCond   []*sync.Cond
+	leaderCond *sync.Cond
 	markhb     []bool      // 标记是否有hearbeat需要发送
 	followerhb []time.Time // 每个follower最新同步的时间
 	applyCh    chan ApplyMsg
@@ -549,6 +550,54 @@ func (rf *Raft) InstallSnapshot(req *InstallSnapshotRequest, reply *InstallSnaps
 	<-wait
 }
 
+type HeartbeatRequest struct {
+	Term     int
+	LeaderId int
+	RpcId    int32
+}
+
+func (req *HeartbeatRequest) String() string {
+	return fmt.Sprintf("req(term=%d, leaderId=%d, rpcId=%d)",
+		req.Term, req.LeaderId, req.RpcId)
+}
+
+type HeartbeatReply struct {
+	Term    int
+	Success bool
+}
+
+func (x *HeartbeatReply) String() string {
+	return fmt.Sprintf("reply(term=%d, ok=%v)", x.Term, x.Success)
+}
+
+func (rf *Raft) Heartbeat(req *HeartbeatRequest, reply *HeartbeatReply) {
+	rf.Lock(419)
+	defer rf.Unlock()
+	reply.Success = false
+	reply.Term = rf.currentTerm
+	trace := strings.Builder{}
+
+	// defer func() {
+	// 	DPrintf("X%d: Heartbeat:%v -> %v %s", rf.me, req, reply, trace.String())
+	// }()
+
+	if req.Term < rf.currentTerm {
+		trace.WriteString("[ignore lower term]")
+		return
+	}
+
+	now := time.Now()
+	rf.lasthb = now
+	rf.lasthbLeader = now
+
+	if req.Term > rf.currentTerm {
+		trace.WriteString("[update higher term]")
+		rf.changeToFollower(req.Term, "Heartbeat")
+	}
+	rf.leaderId = req.LeaderId
+	reply.Success = true
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -590,6 +639,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesRequest, reply 
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotRequest, reply *InstallSnapshotReply) bool {
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendHeartbeat(server int, args *HeartbeatRequest, reply *HeartbeatReply) bool {
+	ok := rf.peers[server].Call("Raft.Heartbeat", args, reply)
 	return ok
 }
 
@@ -688,28 +742,53 @@ func sleepMills(v int) {
 	time.Sleep(time.Duration(v) * time.Millisecond)
 }
 
-// type TimeList []time.Time
+func (rf *Raft) keepHeartbeatWorker(peer int) {
+	if rf.me == peer {
+		return
+	}
 
-// func (x TimeList) Len() int {
-// 	return len(x)
-// }
-// func (x TimeList) Less(i, j int) bool {
-// 	return x[i].UnixNano() < x[j].UnixNano()
-// }
-// func (x TimeList) Swap(i, j int) {
-// 	x[i], x[j] = x[j], x[i]
-// }
+	for {
+		if rf.killed() {
+			break
+		}
+		rf.Lock(743)
+		if !rf.isLeader {
+			rf.leaderCond.Wait()
+			rf.Unlock()
+			continue
+		}
+		now := time.Now()
+		off := now.Sub(rf.followerhb[peer])
+		if off.Milliseconds() > sendHeartbeatInterval {
+			rpcId := newRpcId()
+			req := HeartbeatRequest{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				RpcId:    rpcId,
+			}
+			reply := HeartbeatReply{}
+			rf.Unlock()
 
-// func (rf *Raft) maxFollwerHearbeat() time.Time {
-// 	match := make(TimeList, len(rf.peers))
-// 	for i := 0; i < len(rf.peers); i++ {
-// 		match[i] = rf.followerhb[i]
-// 	}
-// 	sort.Sort(match)
-// 	return match[len(rf.peers)/2]
-// }
+			if !rf.sendHeartbeat(peer, &req, &reply) {
+				sleepMills(checkHeartbeatInterval)
+				continue
+			}
 
-func (rf *Raft) sendHeartbeat() {
+			rf.Lock(794)
+			now := time.Now()
+			rf.followerhb[peer] = now
+			if reply.Term > rf.currentTerm {
+				rf.changeToFollower(reply.Term, "runHeartbeatWorker")
+			}
+			rf.Unlock()
+		} else {
+			rf.Unlock()
+			sleepMills(checkHeartbeatInterval)
+		}
+	}
+}
+
+func (rf *Raft) markHeartbeat() {
 	now := time.Now()
 	rf.lasthb = now
 	rf.followerhb[rf.me] = now
@@ -725,12 +804,11 @@ func (rf *Raft) keepHeartbeat() {
 			break
 		}
 
-		_, isLeader := rf.GetState()
-		if isLeader {
-			rf.Lock(696)
-			rf.sendHeartbeat()
-			rf.Unlock()
+		rf.Lock(825)
+		if rf.isLeader {
+			rf.markHeartbeat()
 		}
+		rf.Unlock()
 		sleepMills(sendHeartbeatInterval)
 	}
 }
@@ -746,7 +824,7 @@ func (rf *Raft) checkHeartbeat() {
 		now := time.Now()
 		rf.Lock(713)
 		off := now.Sub(rf.lasthb)
-		if off.Milliseconds() > (int64(electionTimeout) + (rand.Int63() % electionRandom)) {
+		if off.Milliseconds() > (int64(electionTimeoutBase) + (rand.Int63() % electionTimeoutRandom)) {
 			do = true
 		}
 		if !do && rf.isLeader {
@@ -810,11 +888,12 @@ func (rf *Raft) changeToLeader() {
 		rf.matchIndex[i] = 0
 		rf.followerhb[i] = now
 	}
-	rf.sendHeartbeat()
+	rf.markHeartbeat()
+	rf.leaderCond.Broadcast()
 }
 
 func (rf *Raft) okToRepl(peer int) bool {
-	if !rf.isLeader || rf.me == peer {
+	if !rf.isLeader {
 		return false
 	}
 	if rf.markhb[peer] {
@@ -827,8 +906,11 @@ func (rf *Raft) okToRepl(peer int) bool {
 }
 
 func (rf *Raft) checkReplProgress(peer int) {
-	ok := false // 记录上次是否成功
+	if rf.me == peer {
+		return
+	}
 
+	ok := false // 记录上次是否成功
 	for {
 		if rf.killed() {
 			break
@@ -1071,6 +1153,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.applyCh = applyCh
 	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.leaderCond = sync.NewCond(&rf.mu)
 	rf.replCond = make([]*sync.Cond, len(rf.peers))
 	rf.markhb = make([]bool, len(rf.peers))
 	rf.followerhb = make([]time.Time, len(rf.peers))
@@ -1108,6 +1191,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.checkCommitProgress()
 	for i := 0; i < len(rf.peers); i++ {
 		go rf.checkReplProgress(i)
+		go rf.keepHeartbeatWorker(i)
 	}
 	return rf
 }
