@@ -219,6 +219,8 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.logs)
 	d.Decode(&rf.lastLogIndex)
 	d.Decode(&rf.baseLogIndex)
+	rf.commitIndex = rf.baseLogIndex
+	rf.lastApplied = rf.baseLogIndex
 }
 
 func (rf *Raft) LogCompaction(snapshot []byte, applyIndex int) {
@@ -1209,8 +1211,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.commitIndex = rf.baseLogIndex
-	rf.lastApplied = rf.baseLogIndex
 
 	go rf.checkHeartbeat()
 	go rf.keepHeartbeat()
