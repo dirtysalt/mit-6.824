@@ -333,7 +333,8 @@ func (kv *KVServer) doLogCompaction() {
 	defer kv.Unlock()
 	snapshot := kv.encodeSnapshot()
 	applyIndex := kv.lastApplyIndex
-	kv.rf.LogCompaction(snapshot, applyIndex)
+	// 向前保留几个log可能可以减少同步次数
+	kv.rf.LogCompaction(snapshot, applyIndex-5)
 }
 
 func (kv *KVServer) encodeSnapshot() []byte {
@@ -361,7 +362,7 @@ func (kv *KVServer) logCompactionWorker() {
 		return
 	}
 
-	const COMPACTION_RATIO = 2
+	const COMPACTION_RATIO = 3
 	const CHECK_INTERVAL = 20
 	for {
 		if kv.killed() {
