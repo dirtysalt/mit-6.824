@@ -30,6 +30,14 @@ func SleepMills(v int) {
 	time.Sleep(time.Duration(v) * time.Millisecond)
 }
 
+func TrimString(s string) string {
+	if len(s) > 32 {
+		return s[:32] + "..."
+	} else {
+		return s
+	}
+}
+
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
@@ -76,5 +84,5 @@ type GetReply struct {
 
 func (p *GetReply) String() string {
 	return fmt.Sprintf("reply(err=%s, value=%s)",
-		p.Err, p.Value)
+		p.Err, TrimString(p.Value))
 }

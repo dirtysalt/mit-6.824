@@ -53,6 +53,7 @@ type KVServer struct {
 	lastApplyTime  time.Time
 	rpcTrace       map[int32]time.Time
 	ansBuffer      map[int32]chan *ApplyAnswer
+	moreLogsCond   *sync.Cond
 }
 
 func (kv *KVServer) Lock() {
@@ -137,7 +138,7 @@ func (kv *KVServer) StartAndWaitAnswer(op *Op) (err Err, ans string) {
 	kv.enterRpc(rpcId)
 	defer kv.exitRpc(rpcId)
 	defer func() {
-		DPrintf("kv%d: return rpc#%d -> reply(%s,'%s')", kv.me, rpcId, err, ans)
+		DPrintf("kv%d: return rpc#%d -> reply(%s,'%s')", kv.me, rpcId, err, TrimString(ans))
 	}()
 
 	ch := kv.createRpcChan(rpcId)
@@ -253,55 +254,63 @@ func (kv *KVServer) applyOp(op *Op) (err Err, ans string) {
 	return
 }
 
-func (kv *KVServer) applyWorker() {
-	for {
-		msg := <-kv.applyCh
-		if msg.CommandValid {
-			op := msg.Command.(Op)
-			byMe := (op.ServerId == kv.me)
-			if byMe {
-				DPrintf("kv%d: apply message %v, term = %d, index = %d", kv.me, &op, msg.CommandTerm, msg.CommandIndex)
-			}
-
-			kv.Lock()
-			// 如果这个日志已经执行过的话，那么就不要继续执行了
-			if msg.CommandIndex <= kv.lastApplyIndex {
-				kv.Unlock()
-				continue
-			}
-			err, value := kv.applyOp(&op)
-			kv.lastApplyIndex = msg.CommandIndex
-			kv.lastApplyTerm = msg.CommandTerm
-			kv.lastApplyTime = time.Now()
-
-			// // if byMe {
-			// DPrintf("kv%d: data = %v", kv.me, kv.data)
-			// // }
-
-			ans := ApplyAnswer{
-				Term:  msg.CommandTerm,
-				Index: msg.CommandIndex,
-				Err:   err,
-				Value: value,
-			}
-
-			kv.submitAnswer(&msg, &ans)
-			kv.Unlock()
-
-		} else {
-			DPrintf("kv%d: apply message %v", kv.me, &msg)
-			op := msg.OpName
-			if op == "kill" {
-				DPrintf("kv%d: kill apply worker", kv.me)
-				break
-			} else if op == "install" {
-				DPrintf("kv%d: install snapshot. rpcId=%d", kv.me, msg.RpcId)
-				data := msg.Command.([]byte)
-				wait := msg.WaitChan
-				kv.doInstallSnapshot(data)
-				wait <- "ok"
-			}
+func (kv *KVServer) applyMessage(msg *raft.ApplyMsg) {
+	if msg.CommandValid {
+		op := msg.Command.(Op)
+		byMe := (op.ServerId == kv.me)
+		if byMe {
+			DPrintf("kv%d: Leader apply message %v, term = %d, index = %d", kv.me, &op, msg.CommandTerm, msg.CommandIndex)
 		}
+		DPrintf("kv%d: apply message %v, term = %d, index = %d", kv.me, &op, msg.CommandTerm, msg.CommandIndex)
+
+		kv.Lock()
+		if msg.CommandIndex > kv.lastApplyIndex && msg.CommandIndex != (kv.lastApplyIndex+1) {
+			panic(fmt.Sprintf("kv%d: apply message index not consecutive. msgIndex = %d, applyIndex = %d", kv.me, msg.CommandIndex, kv.lastApplyIndex))
+		}
+		// 如果这个日志已经执行过的话，那么就不要继续执行了
+		if msg.CommandIndex <= kv.lastApplyIndex {
+			kv.Unlock()
+			return
+		}
+		err, value := kv.applyOp(&op)
+		kv.lastApplyIndex = msg.CommandIndex
+		kv.lastApplyTerm = msg.CommandTerm
+		kv.lastApplyTime = time.Now()
+
+		// // if byMe {
+		// DPrintf("kv%d: data = %v", kv.me, kv.data)
+		// // }
+
+		ans := ApplyAnswer{
+			Term:  msg.CommandTerm,
+			Index: msg.CommandIndex,
+			Err:   err,
+			Value: value,
+		}
+
+		kv.submitAnswer(msg, &ans)
+		kv.moreLogsCond.Signal()
+		kv.Unlock()
+
+	} else {
+		op := msg.OpName
+		if op == "install" {
+			DPrintf("kv%d: install snapshot. rpcId=%d", kv.me, msg.RpcId)
+			data := msg.Command.([]byte)
+			wait := msg.WaitChan
+			kv.doInstallSnapshot(data)
+			wait <- "ok"
+			// 这里安装完成了snapshot之后
+			// 最好在做一个snapshot. 不然如果这个时候重启的话
+			// applyIndex会回滚到之前的状态，而这个状态没有办法接着继续
+			kv.doLogCompaction()
+		}
+	}
+}
+
+func (kv *KVServer) applyWorker() {
+	for msg := range kv.applyCh {
+		kv.applyMessage(&msg)
 	}
 }
 
@@ -314,6 +323,7 @@ func (kv *KVServer) doInstallSnapshot(data []byte) {
 	if kv.lastApplyIndex < lastApplyIndex {
 		panic(fmt.Sprintf("kv%d: apply index goes backward %d->%d", kv.me, kv.lastApplyIndex, lastApplyIndex))
 	}
+	DPrintf("kv%d: apply message. install snapshot. apply index %d -> %d", kv.me, lastApplyIndex, kv.lastApplyIndex)
 }
 
 func (kv *KVServer) doLogCompaction() {
@@ -352,16 +362,21 @@ func (kv *KVServer) logCompactionWorker() {
 	}
 
 	const COMPACTION_RATIO = 2
-	const CHECK_INTERVAL = 100
+	const CHECK_INTERVAL = 20
 	for {
 		if kv.killed() {
 			break
 		}
+		kv.Lock()
 		size := kv.persister.RaftStateSize()
-		if float64(size) > float64(kv.maxraftstate)*COMPACTION_RATIO {
-			DPrintf("kv%d: make log compaction, current size = %d, threshold = %d", kv.me, size, kv.maxraftstate)
-			kv.doLogCompaction()
+		if float64(size) < float64(kv.maxraftstate)*COMPACTION_RATIO {
+			kv.moreLogsCond.Wait()
+			kv.Unlock()
+			continue
 		}
+		kv.Unlock()
+		DPrintf("kv%d: make log compaction, current size = %d, threshold = %d", kv.me, size, kv.maxraftstate)
+		kv.doLogCompaction()
 		SleepMills(CHECK_INTERVAL)
 	}
 }
@@ -404,11 +419,8 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
-	msg := raft.ApplyMsg{
-		CommandValid: false,
-		OpName:       "kill",
-	}
-	kv.applyCh <- msg
+	// 保险起见，在关闭的时候也在做一次snapshot.
+	kv.doLogCompaction()
 }
 
 func (kv *KVServer) killed() bool {
@@ -451,6 +463,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rpcTrace = make(map[int32]time.Time)
 	kv.ansBuffer = make(map[int32]chan *ApplyAnswer)
 	kv.lastApplyTime = time.Now()
+	kv.moreLogsCond = sync.NewCond(&kv.mu)
 
 	kv.decodeSnapshot(persister.ReadSnapshot())
 	go kv.applyWorker()

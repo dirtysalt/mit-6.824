@@ -301,7 +301,7 @@ func (rf *Raft) DiscardLogs(index int, term int) {
 	rf.commitIndex = index
 }
 
-var DEBUG_DUMP_LOGS = 1
+var DEBUG_DUMP_LOGS = 0
 
 func (rf *Raft) dumpLogs(where string) {
 	if DEBUG_DUMP_LOGS == 0 {
@@ -434,7 +434,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesRequest, reply *AppendEntriesRep
 	// 因为logcompaction会造成idx < 0
 	if idx < 0 || idx >= len(rf.logs) {
 		DPrintf("X%d: mismatch log entry size. prevIndex=%d, baseIndex=%d, lastIndex=%d",
-			req.PrevLogIndex, rf.baseLogIndex, rf.lastLogIndex)
+			rf.me, req.PrevLogIndex, rf.baseLogIndex, rf.lastLogIndex)
 		idx = len(rf.logs) - 1
 	} else if idx >= 0 && rf.logs[idx].Term != req.PrevLogTerm {
 		fastRollback := true
